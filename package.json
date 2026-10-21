@@ -1,0 +1,24 @@
+{
+  "name": "cli-chatbot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.4.1",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "dev": "tsx --env-file=.env src/index.ts",
+    "start": "tsx --env-file=.env src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5",
+    "vitest": "^3"
+  }
+}

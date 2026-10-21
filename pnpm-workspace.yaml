@@ -1,0 +1,6 @@
+---
+# pnpm 12 用 allowBuilds 显式批准哪些依赖可以执行 install 脚本
+# （旧的 package.json "pnpm" 字段与 onlyBuiltDependencies 已被 pnpm 11+ 废弃）。
+# esbuild 是 tsx / vitest 的底层依赖，必须跑 postinstall 才能就位。
+allowBuilds:
+  esbuild: true
