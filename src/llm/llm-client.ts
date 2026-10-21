@@ -30,7 +30,11 @@ export type TransportRequest = (
 ) => Promise<JsonResponse<unknown>>;
 
 export interface LlmClientDeps {
-  readonly config: AppConfig;
+  /**
+   * 配置**读取器**而不是配置本身：`/config` 可以在会话内改 model / maxTokens / temperature，
+   * 每次请求现取一次，改动下一回合就生效（启动时的对象是 `Object.freeze` 的，改不动）。
+   */
+  readonly config: () => AppConfig;
   readonly transport: TransportRequest;
   /** 重试日志回调：`[retry] attempt 1 failed: ServerError 500, retrying in 512ms (backoff)`。 */
   readonly log?: (message: string) => void;
@@ -159,11 +163,12 @@ function formatRetryEvent(event: RetryLogEvent): string {
 }
 
 export function createLlmClient(deps: LlmClientDeps): LlmClient {
-  const { config, transport } = deps;
-  const url = `${config.baseUrl}${CHAT_COMPLETIONS_PATH}`;
+  const { transport } = deps;
 
   return {
     async chat(messages, opts) {
+      const config = deps.config();
+      const url = `${config.baseUrl}${CHAT_COMPLETIONS_PATH}`;
       const response = await transport(url, buildPayload(config, messages), buildHeaders(config), buildTransportOptions(config, deps.log, opts));
 
       const body = response.body;

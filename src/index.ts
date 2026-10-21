@@ -10,7 +10,8 @@
 
 import { runRepl, EXIT_FAILURE } from './cli/repl.js';
 import { renderError } from './cli/render.js';
-import { loadConfig, type AppConfig, type LogLevel } from './config.js';
+import { loadConfig, type LogLevel } from './config.js';
+import { createConfigStore, type ConfigStore } from './config-store.js';
 import { postJson } from './http/transport.js';
 import { createLlmClient } from './llm/llm-client.js';
 import { createChatSession } from './session/chat-session.js';
@@ -40,19 +41,21 @@ function createLog(threshold: LogLevel): Log {
 }
 
 async function main(): Promise<number> {
-  let config: AppConfig;
+  let store: ConfigStore;
   try {
-    config = loadConfig(process.env);
+    store = createConfigStore(loadConfig(process.env));
   } catch (cause) {
     // 配置错误是唯一「还没进 REPL 就该退出」的错误：退出码 1。
     process.stderr.write(`${renderError(cause).text}\n`);
     return EXIT_FAILURE;
   }
 
+  const config = store.get();
   const log = createLog(config.logLevel);
 
   const llm = createLlmClient({
-    config,
+    // 传读取器：`/config` 改完的值下一回合才生效。
+    config: () => store.get(),
     transport: postJson,
     // 重试日志属于 info：默认级别下就能在终端看到重试了几次。
     log: (message) => log('info', message),
@@ -65,7 +68,7 @@ async function main(): Promise<number> {
   });
 
   // `usage` 只在 debug 下打印，属于诊断信息。
-  return runRepl({ session, config, log: (message) => log('debug', message) });
+  return runRepl({ session, store, log: (message) => log('debug', message) });
 }
 
 const exitCode = await main();

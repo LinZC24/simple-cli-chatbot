@@ -21,6 +21,8 @@ import {
   type ShutdownDeps,
 } from '../src/cli/repl.js';
 import { loadConfig } from '../src/config.js';
+import { createConfigStore, type ConfigStore } from '../src/config-store.js';
+import type { EnvFileResult } from '../src/env-file.js';
 import { AuthError, UserAbortError } from '../src/http/errors.js';
 import type { AssistantMessage, ChatMessage } from '../src/llm/types.js';
 import { createChatSession, type ChatSession } from '../src/session/chat-session.js';
@@ -76,7 +78,14 @@ interface ReplRun {
 }
 
 /** 把若干行输入喂给 `runRepl`，收齐输出与退出码。 */
-async function run(lines: readonly string[], options: { session?: ChatSession; exit?: (code: number) => void } = {}): Promise<ReplRun> {
+interface RunOptions {
+  readonly session?: ChatSession;
+  readonly store?: ConfigStore;
+  readonly exit?: (code: number) => void;
+  readonly saveEnv?: (updates: Readonly<Record<string, string | undefined>>) => Promise<EnvFileResult>;
+}
+
+async function run(lines: readonly string[], options: RunOptions = {}): Promise<ReplRun> {
   const session = options.session ?? makeSession().session;
   const input = new PassThrough();
   const out = collector();
@@ -84,12 +93,13 @@ async function run(lines: readonly string[], options: { session?: ChatSession; e
 
   const done = runRepl({
     session,
-    config,
+    store: options.store ?? createConfigStore(config),
     input,
     output: out.stream,
     errorOutput: err.stream,
     log: () => {},
     ...(options.exit === undefined ? {} : { exit: options.exit }),
+    ...(options.saveEnv === undefined ? {} : { saveEnv: options.saveEnv }),
   });
 
   input.end(lines.map((line) => `${line}\n`).join(''));
@@ -349,7 +359,7 @@ describe('runRepl：对话与命令', () => {
     const err = collector();
     const done = runRepl({
       session: makeSession().session,
-      config,
+      store: createConfigStore(config),
       input,
       output: out.stream,
       errorOutput: err.stream,
@@ -376,7 +386,7 @@ describe('runRepl：对话与命令', () => {
     const logs: string[] = [];
     const done = runRepl({
       session,
-      config: debugConfig,
+      store: createConfigStore(debugConfig),
       input,
       output: out.stream,
       errorOutput: err.stream,
@@ -402,7 +412,7 @@ describe('runRepl：对话与命令', () => {
     const logs: string[] = [];
     const done = runRepl({
       session,
-      config,
+      store: createConfigStore(config),
       input,
       output: out.stream,
       errorOutput: err.stream,
@@ -469,5 +479,154 @@ describe('runRepl：信号监听的生命周期', () => {
 
     expect(process.listenerCount('SIGINT')).toBe(sigintBefore);
     expect(process.listenerCount('SIGTERM')).toBe(sigtermBefore);
+  });
+});
+
+describe('runRepl：/config', () => {
+  it('/config 打印编号表、只读汇总与菜单提示', async () => {
+    const result = await run(['/config', '', '/exit']);
+
+    expect(result.stdout).toContain('当前配置');
+    expect(result.stdout).toContain('1) model');
+    expect(result.stdout).toContain('4) temperature');
+    expect(result.stdout).toContain('只读（改 .env 后重启）：');
+    expect(result.stdout).toContain('apiKey=已设置');
+    expect(result.stdout).toContain('输入编号修改，回车取消：');
+  });
+
+  it('菜单里选编号、再输入新值即可改掉', async () => {
+    const result = await run(['/config', '1', 'gpt-4.1', '/config', '']);
+
+    expect(result.stdout).toContain('✓ model → gpt-4.1');
+    // 改过之后表格里带 `*`。
+    expect(result.stdout).toContain('* 1) model');
+    expect(result.stdout).toContain('gpt-4.1');
+  });
+
+  it('编号非法时留在菜单里，再给一次机会', async () => {
+    const result = await run(['/config', '9', '2', '你是一名译者', '']);
+
+    expect(result.stdout).toContain('无效编号：9');
+    expect(result.stdout).toContain('✓ systemPrompt → 你是一名译者');
+  });
+
+  it('菜单里直接回车表示取消，且那一行不会被当成对话发给模型', async () => {
+    const harness = makeSession();
+    const result = await run(['/config', '', '/exit'], { session: harness.session });
+
+    expect(result.stdout).toContain('已取消修改。');
+    expect(harness.requests).toEqual([]);
+  });
+
+  it('菜单里输入的值也要过校验，非法值报配置错误且不改', async () => {
+    const result = await run(['/config', '3', 'abc', '/config', '']);
+
+    expect(result.stderr).toContain('! 配置错误:');
+    expect(result.stderr).toContain('maxTokens');
+    expect(result.stdout).not.toContain('✓ maxTokens');
+  });
+
+  it('/config set 一行直达', async () => {
+    const result = await run(['/config set model gpt-4.1', '/config', '']);
+
+    expect(result.stdout).toContain('✓ model → gpt-4.1（下一回合生效）');
+    expect(result.stdout).toContain('gpt-4.1');
+  });
+
+  it('/config set 值里可以带空格', async () => {
+    const harness = makeSession();
+    const result = await run(['/config set systemPrompt 你是译者 只输出译文', '/exit'], { session: harness.session });
+
+    expect(result.stdout).toContain('✓ systemPrompt → 你是译者 只输出译文');
+    expect(harness.session.getSystemPrompt()).toBe('你是译者 只输出译文');
+  });
+
+  it('/config set 用 - 恢复默认', async () => {
+    const result = await run(['/config set model gpt-4.1', '/config set model -', '/config', '']);
+
+    expect(result.stdout).toContain('✓ model → gpt-4o-mini');
+  });
+
+  it('/config set 缺参数时打印用法', async () => {
+    const result = await run(['/config set', '/exit']);
+    expect(result.stdout).toContain('用法：/config set');
+  });
+
+  it('/config set 未知键名时列出可改项', async () => {
+    const result = await run(['/config set apiKey sk-hack', '/exit']);
+
+    expect(result.stdout).toContain('未知配置项：apiKey');
+    expect(result.stdout).toContain('其余项请改 .env 后重启');
+  });
+
+  it('/config reset 恢复启动时的配置', async () => {
+    const result = await run(['/config set model gpt-4.1', '/config reset', '/config', '']);
+
+    expect(result.stdout).toContain('已恢复启动时的配置。');
+    expect(result.stdout).toContain('gpt-4o-mini');
+    expect(result.stdout).not.toContain('* 1) model');
+  });
+
+  it('/config save 没有改动时不碰文件', async () => {
+    const calls: Record<string, string | undefined>[] = [];
+    const result = await run(['/config save', '/exit'], {
+      saveEnv: async (updates) => {
+        calls.push({ ...updates });
+        return { ok: true, changed: [], backupPath: '.env.bak' };
+      },
+    });
+
+    expect(calls).toEqual([]);
+    expect(result.stdout).toContain('无需改动');
+  });
+
+  it('/config save 只写改动过的项', async () => {
+    const calls: Record<string, string | undefined>[] = [];
+    const result = await run(['/config set model gpt-4.1', '/config set temperature 0.2', '/config save', '/exit'], {
+      saveEnv: async (updates) => {
+        calls.push({ ...updates });
+        return { ok: true, changed: ['LLM_MODEL', 'LLM_TEMPERATURE'], backupPath: '.env.bak' };
+      },
+    });
+
+    expect(calls).toEqual([{ LLM_MODEL: 'gpt-4.1', LLM_TEMPERATURE: '0.2' }]);
+    expect(result.stdout).toContain('已写入 .env：LLM_MODEL、LLM_TEMPERATURE');
+  });
+
+  it('/config save 把「清掉的可选项」表示成删除该行', async () => {
+    const calls: Record<string, string | undefined>[] = [];
+    const store = createConfigStore(loadConfig({ LLM_API_KEY: 'sk-test', LLM_MAX_TOKENS: '256' }));
+    await run(['/config set maxTokens -', '/config save', '/exit'], {
+      store,
+      saveEnv: async (updates) => {
+        calls.push({ ...updates });
+        return { ok: true, changed: ['LLM_MAX_TOKENS'], backupPath: '.env.bak' };
+      },
+    });
+
+    expect(calls).toEqual([{ LLM_MAX_TOKENS: undefined }]);
+  });
+
+  it('/config save 失败走 stderr，不影响退出码', async () => {
+    const result = await run(['/config set model gpt-4.1', '/config save', '/exit'], {
+      saveEnv: async (): Promise<EnvFileResult> => ({ ok: false, reason: 'missing', message: '.env 不存在' }),
+    });
+
+    expect(result.stderr).toContain('! 保存失败: .env 不存在');
+    expect(result.code).toBe(EXIT_OK);
+  });
+
+  it('/config 未知子命令按未知命令处理', async () => {
+    const result = await run(['/config foo', '/exit']);
+    expect(result.stdout).toContain('/config foo');
+  });
+
+  it('parseInput 把 /config 的各种写法分开', () => {
+    expect(parseInput('/config')).toEqual({ kind: 'config', sub: 'show' });
+    expect(parseInput('/config save')).toEqual({ kind: 'config', sub: 'save' });
+    expect(parseInput('/config reset')).toEqual({ kind: 'config', sub: 'reset' });
+    expect(parseInput('/config SET Model gpt-4.1')).toEqual({ kind: 'config', sub: 'set', key: 'Model', value: 'gpt-4.1' });
+    expect(parseInput('/config set systemPrompt a b  c')).toEqual({ kind: 'config', sub: 'set', key: 'systemPrompt', value: 'a b  c' });
+    expect(parseInput('/config wat')).toEqual({ kind: 'config', sub: 'unknown', name: 'wat' });
   });
 });

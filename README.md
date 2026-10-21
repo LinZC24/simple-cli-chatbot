@@ -38,24 +38,45 @@ pnpm dev                  # 等同 pnpm start
 | `/reset` | 清空历史，system prompt 保留 |
 | `/system <文本>` | 换 system prompt（不回显历史，也不改动已有历史） |
 | `/history` | 打印条数 + 每条角色和前 60 字 |
+| `/config` | 列出可改项（编号菜单），回车取消 |
+| `/config set <键> <值>` | 一行直达；值写 `-` 恢复默认 |
+| `/config reset` | 恢复启动时的配置（本次会话内） |
+| `/config save` | 把改动写回 `.env`（原文件备份为 `.env.bak`） |
 | `/help` | 命令列表 |
 | 空行 | 忽略 |
+| 退格 / 方向键 / ↑ / Ctrl-C | 交互模式的编辑键由 readline 处理；↑ 翻回上一句，Tab 补全已关掉 |
 | Ctrl-C | 第一次取消当前回合后退出 `130`，再按一次立刻退出 |
 
 正文走 stdout，错误走 stderr（`! 错误前缀: 详情`），所以 `pnpm dev > chat.log` 里不会混进报错。
+
+### `/config` 能改什么
+
+| 项 | 说明 |
+| --- | --- |
+| `model` | 换模型，下一回合生效 |
+| `systemPrompt` | 换 system prompt，同时同步给会话层 |
+| `maxTokens` | `-` 表示不发送该字段 |
+| `temperature` | 0~2，`-` 表示不发送该字段 |
+
+改完只活在本次会话里，想让下次启动也带上就 `/config save`：它会**只**把改动过的项写回 `.env`（先备份 `.env.bak`，带空格或 `#` 的值自动加引号）。
+`apiKey`、`baseUrl`、`timeoutMs`、`maxRetries`、`maxHistoryMessages`、`logLevel` 故意不给改：
+它们在进程启动时就被交给传输层了，运行时改只会让人以为改了。它们在表格里显示成一行只读汇总，
+`apiKey` 连片段都不露（只显示“已设置 / 未设置”）。
 
 ## 分层
 
 | 位置 | 职责 | 不许做 |
 | --- | --- | --- |
 | `src/config.ts:1` | 把 `process.env` 变成校验过的 `AppConfig` | 读文件、抛非 `ConfigError` |
+| `src/config-store.ts:1` | 会话内配置的当前值：`get` / `set` / `reset` / `modifiedKeys` | 写 `.env`、碰终端 |
+| `src/env-file.ts:1` | 把改动写回 `.env`（纯函数合并 + 备份） | 决定该写哪些键 |
 | `src/http/errors.ts:1` | 错误分类（可重试 / 不可重试） | 造文案、打日志 |
 | `src/http/retry.ts:1` | 纯函数 `decide(error, attemptsMade, opts)` | 真的 sleep |
 | `src/http/transport.ts:1` | 唯一调 `fetch` 的地方：超时、重试循环、状态码映射 | 知道 LLM 协议的形状 |
 | `src/llm/llm-client.ts:1` | 唯一知道 `choices[0].message.content` 的地方：拼请求、校验响应 | 重试、管历史、打印 |
 | `src/session/chat-session.ts:1` | 唯一改 `messages` 的地方：回合事务、裁剪历史 | 碰网络、碰终端 |
 | `src/cli/render.ts:1` | 纯函数出文案：前缀、错误文案、截断提示 | 判断错误该怎么处理 |
-| `src/cli/repl.ts:1` | 读行、解析斜杠命令、信号与退出码 | 组装请求、解析响应 |
+| `src/cli/repl.ts:1` | 读行、解析斜杠命令、菜单状态机、信号与退出码 | 组装请求、解析响应 |
 | `src/index.ts:1` | 装配：config → transport → client → session → repl | 写字面量文案 |
 
 两条硬规则贯穿全项目：**`fetch` 只出现在传输层**，**`messages` 只在会话层被改**。
@@ -82,7 +103,7 @@ pnpm dev                  # 等同 pnpm start
 
 ```bash
 pnpm typecheck                        # exit 0
-pnpm test                             # 9 个文件 253 条
+pnpm test                             # 12 个文件 340 条
 pnpm test:watch
 grep -rn ': any\b' src/               # 无输出
 grep -rn ' as [A-Z]' src/             # 只有 src/http/transport.ts:210 的 JSON.parse 边界
@@ -125,9 +146,12 @@ node scripts/record-demo.mjs  # 重新生成（会覆盖）
    `node` 以退出码 `13`（unsettled top-level await）结束。改成 `for await (const line of rl)` 之后，
    流结束就是循环结束，提示符自己 `output.write('you> ')` 打印。
 
-2. **`terminal: false` 换来的是「Ctrl-C 变成真信号」，代价是不回显输入。** 开了 terminal，
-   readline 会自己捕获 Ctrl-C 变成 `'SIGINT'` 事件，进程信号和它要处理两遍；关掉之后只剩 `process.on('SIGINT')`
-   一处。但行规程不再回显，管道/录像里会看到 `you> bot> ...` 粘成一坨——所以非 TTY 时自己回显一遍输入。
+2. **退格到底由谁擦，取决于 `terminal`——这是真机上「退格删不掉字」的根因。** `terminal: false` 把擦除
+   交给内核的行规程（cooked 模式），只有在 cooked 的 pty 里才灵；可 stdin 是 cooked 还是 raw 由**父进程**决定，
+   在 raw 的 pty 里（终端复用器、IDE 任务、`script` 之类）`\x7f` 会原样送进程序，退格变成「删不掉」，
+   控制字符还会跟着正文一起发给模型。现在两边都是 TTY 就 `terminal: true`，由 readline 自己解析按键
+   （退格 / 方向键 / Ctrl-C 都变成它的事件），不再依赖终端模式。代价是 Ctrl-C 不再是进程信号，`process.on`
+   和 `rl.on('SIGINT')` 两处都要接；管道与测试里仍然关掉 terminal，并自己回显一遍输入。
 
 3. **`Date.parse()` 比想象中宽容得多。** `Retry-After: 1.5` 或 `-1` 会被 V8 解析成一个具体日期，
    算出「已经过去了」再 `max(0, ...)` 得到 `0`，于是非法的 `Retry-After` 被当成「立刻重试」，
@@ -154,12 +178,30 @@ node scripts/record-demo.mjs  # 重新生成（会覆盖）
    程序其实还在等那 1 秒的重试，真实输出的时间戳全被 `Math.max(clock, at)` 夹到同一刻，
    `Retry-After: 1` 在录像里变成 140ms。改成真 `sleep` + 「会话开始时刻 + 真实经过时间」算绝对时间才如实。
 
+9. **`Object.freeze` 的配置改不动，所以「改配置」必须靠换对象 + 现取。** `createLlmClient` 一开始把
+   `config` 捕获进闭包、连 `url` 都算好了，`/config` 改完一点反应都没有。改成传「读取器」
+   `config: () => AppConfig`（每次请求现取一次），存储层 `src/config-store.ts:1` 负责换成新对象，
+   改 `model` / `maxTokens` 才对下一回合生效。同一个坑还有第二半：`systemPrompt` 存在会话层自己手里，
+   改配置时必须顺手 `setSystemPrompt`，否则又是不生效。
+
+10. **能改的东西少一点，比“什么都能改”更好用。** `apiKey` 不给改（只露「已设置 / 未设置」），
+    `baseUrl` / `timeoutMs` / `maxRetries` 也不给改：它们在启动时已经交给传输层了。
+    花在“运行时改传输入参”上的代码量会远大于它的价值，而用户只需要重启。
+
+11. **开了 `terminal: true`，提示符就不能用 `output.write()` 画。** readline 需要知道提示符的长度，
+    才能在退格 / 方向键之后把整行重绘到正确位置；自己 `write()` 出去的那一行它根本不知道，
+    编辑时就会出现「提示符被擦掉」「光标错位」。必须 `rl.setPrompt(text); rl.prompt()`，
+    取值提示（`/config` 里等新值那一行）同样如此。顺带白拿两个交互细节：`historySize` 让 ↑ 能翻回上一句，
+    `completer` 返回空数组把 Tab 补全关掉——聊天框里蹦出一串 JS 标识符候选纯属碍事。
+
 ## 目录
 
 ```text
 src/
   index.ts                装配 + 退出码
   config.ts               env → AppConfig（纯函数）
+  config-store.ts         会话内配置当前值（/config 的真相）
+  env-file.ts             改动写回 .env（合并 + 备份）
   http/
     errors.ts             错误体系：可重试 / 不可重试
     retry.ts              重试决策（纯函数）
@@ -172,7 +214,7 @@ src/
   cli/
     render.ts             文案
     repl.ts               readline、斜杠命令、信号
-test/                     L1 + L2 + L3，253 条
+test/                     L1 + L2 + L3，340 条
 scripts/record-demo.mjs   生成 demo.cast
 ```
 

@@ -12,7 +12,8 @@
  * 由消息本身保证，渲染层不再重复拼接。
  */
 
-import type { AppConfig } from '../config.js';
+import type { AppConfig, MutableConfigKey } from '../config.js';
+import { DEFAULT_MODEL, MUTABLE_CONFIG_KEYS } from '../config.js';
 import {
   AgentError,
   AuthError,
@@ -151,6 +152,10 @@ export function renderHelp(): string {
     '  /reset           清空历史（保留 system prompt）',
     '  /system <文本>   替换 system prompt（下一轮生效，历史不动）',
     '  /history         查看当前历史（条数 + 角色 + 前 60 字符）',
+    '  /config          查看并修改 model / systemPrompt / maxTokens / temperature',
+    '  /config set <键> <值>  直接改一项（值写 - 则恢复默认）',
+    '  /config reset    恢复启动时的配置（本次会话内）',
+    '  /config save     把改动写回 .env（自动备份 .env.bak）',
     '  /help            显示这份帮助',
     '其他输入都当作对话内容；空行忽略；Ctrl-C 取消当前回合。',
   ].join('\n');
@@ -192,6 +197,119 @@ export function renderUnknownCommand(name: string): string {
 /** debug 级别的 usage 行。 */
 export function renderUsage(usage: Usage): string {
   return `[usage] prompt=${usage.promptTokens} completion=${usage.completionTokens} total=${usage.totalTokens}`;
+}
+
+/** config 表格里值的截断宽度：比 `/history` 宽一点，够看清 model 与 prompt 开头。 */
+export const CONFIG_VALUE_LIMIT = 40;
+/** `/config` 菜单的等待输入提示（不带换行，紧跟用户输入）。 */
+export const CONFIG_MENU_PROMPT = '输入编号修改，回车取消：';
+
+/** 密钥只回答「有没有」，不露任何片段 —— 终端回滚与录像都不该记住它。 */
+export function describeApiKey(apiKey: string): string {
+  return apiKey === '' ? '未设置' : '已设置';
+}
+
+/** 把一个可改项当前的值渲染成一行文本；未设置的可选字段显式写出来。 */
+export function describeConfigValue(config: AppConfig, key: MutableConfigKey): string {
+  switch (key) {
+    case 'model':
+      return config.model;
+    case 'systemPrompt':
+      return preview(config.systemPrompt, CONFIG_VALUE_LIMIT);
+    case 'maxTokens':
+      return config.maxTokens === undefined ? '(未设置)' : String(config.maxTokens);
+    case 'temperature':
+      return config.temperature === undefined ? '(未设置)' : String(config.temperature);
+  }
+}
+
+/** 一行「是否默认值」的提示，用在取值提示里。 */
+function describeDefaultHint(key: MutableConfigKey): string {
+  switch (key) {
+    case 'model':
+      return `默认 ${DEFAULT_MODEL}`;
+    case 'systemPrompt':
+      return '默认内置提示语';
+    case 'maxTokens':
+      return '未设置则不发送';
+    case 'temperature':
+      return '未设置则不发送';
+  }
+}
+
+/**
+ * `/config` 的主表格：只把四项可改项编号，其余集中成一行只读说明。
+ *
+ * 只读项不编号是有意的：菜单里每一项都能按下去，就不该出现「这个改了没用」。
+ */
+export function renderConfigTable(config: AppConfig, modified: readonly MutableConfigKey[]): string {
+  const rows = MUTABLE_CONFIG_KEYS.map((key, index) => {
+    const mark = modified.includes(key) ? '*' : ' ';
+    return `${mark} ${String(index + 1)}) ${key.padEnd(13)} ${describeConfigValue(config, key)}`;
+  });
+
+  const readonlyParts = [
+    `apiKey=${describeApiKey(config.apiKey)}`,
+    `baseUrl=${config.baseUrl}`,
+    `timeoutMs=${config.timeoutMs}`,
+    `maxRetries=${config.maxRetries}`,
+    `maxHistoryMessages=${config.maxHistoryMessages}`,
+    `logLevel=${config.logLevel}`,
+  ];
+
+  return [
+    '当前配置（* = 本次会话内已修改）：',
+    ...rows,
+    `  只读（改 .env 后重启）：${readonlyParts.join('  ')}`,
+  ].join('\n');
+}
+
+/** 选完编号后提示输入新值。 */
+export function renderConfigValuePrompt(key: MutableConfigKey, config: AppConfig): string {
+  return `${key}（当前 ${describeConfigValue(config, key)}；${describeDefaultHint(key)}；输入 - 恢复默认）：`;
+}
+
+/** 改动成功的回执，带上新值，方便立刻确认自己改对了。 */
+export function renderConfigUpdated(key: MutableConfigKey, config: AppConfig): string {
+  return `✓ ${key} → ${describeConfigValue(config, key)}（下一回合生效）`;
+}
+
+/** 编号不在范围内。 */
+export function renderConfigUnknownChoice(raw: string): string {
+  return `无效编号：${raw}。输入 1~${MUTABLE_CONFIG_KEYS.length}，或直接回车取消。`;
+}
+
+/** 菜单里直接回车。 */
+export function renderConfigCancelled(): string {
+  return '已取消修改。';
+}
+
+/** `/config set` 的键名不认识。 */
+export function renderConfigUnknownKey(name: string): string {
+  return `未知配置项：${name}。可改：${MUTABLE_CONFIG_KEYS.join(' / ')}；其余项请改 .env 后重启。`;
+}
+
+/** `/config set` 少参数。 */
+export function renderConfigSetUsage(): string {
+  return `用法：/config set <${MUTABLE_CONFIG_KEYS.join(' | ')}> <值>（值写 - 恢复默认）`;
+}
+
+/** `/config reset` 的回执。 */
+export function renderConfigResetDone(): string {
+  return '已恢复启动时的配置。';
+}
+
+/** `/config save` 成功：列出写了哪几个变量。 */
+export function renderConfigSaved(changed: readonly string[]): string {
+  if (changed.length === 0) {
+    return '✓ .env 已是目标值，无需改动。';
+  }
+  return `✓ 已写入 .env：${changed.join('、')}（原文件备份为 .env.bak）`;
+}
+
+/** `/config save` 失败：只给原因与下一步，不抛异常。 */
+export function renderConfigSaveFailed(message: string): string {
+  return `${ERROR_PREFIX}保存失败: ${message}`;
 }
 
 /** 单行预览：压掉换行，超长截断。 */

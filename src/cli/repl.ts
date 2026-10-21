@@ -19,12 +19,27 @@
  */
 
 import { createInterface } from 'node:readline/promises';
-import type { AppConfig } from '../config.js';
-import { UserAbortError } from '../http/errors.js';
+import type { AppConfig, MutableConfigKey } from '../config.js';
+import { MUTABLE_CONFIG_ENV_VARS, MUTABLE_CONFIG_KEYS, isMutableConfigKey } from '../config.js';
+import type { ConfigStore } from '../config-store.js';
+import type { EnvFileResult } from '../env-file.js';
+import { updateEnvFile } from '../env-file.js';
+import { ConfigError, UserAbortError } from '../http/errors.js';
 import type { ChatSession } from '../session/chat-session.js';
 import {
+  CONFIG_MENU_PROMPT,
   PROMPT,
   renderBanner,
+  renderConfigCancelled,
+  renderConfigResetDone,
+  renderConfigSaveFailed,
+  renderConfigSaved,
+  renderConfigSetUsage,
+  renderConfigTable,
+  renderConfigUnknownChoice,
+  renderConfigUnknownKey,
+  renderConfigUpdated,
+  renderConfigValuePrompt,
   renderError,
   renderHistory,
   renderHelp,
@@ -55,6 +70,11 @@ export type ParsedInput =
   | { readonly kind: 'system'; readonly text: string }
   | { readonly kind: 'history' }
   | { readonly kind: 'help' }
+  | { readonly kind: 'config'; readonly sub: 'show' }
+  | { readonly kind: 'config'; readonly sub: 'set'; readonly key: string; readonly value: string }
+  | { readonly kind: 'config'; readonly sub: 'reset' }
+  | { readonly kind: 'config'; readonly sub: 'save' }
+  | { readonly kind: 'config'; readonly sub: 'unknown'; readonly name: string }
   | { readonly kind: 'unknown'; readonly name: string }
   | { readonly kind: 'message'; readonly text: string };
 
@@ -89,8 +109,44 @@ export function parseInput(line: string): ParsedInput {
       return { kind: 'history' };
     case '/help':
       return { kind: 'help' };
+    case '/config':
+      return parseConfigCommand(rest);
     default:
       return { kind: 'unknown', name };
+  }
+}
+
+/**
+ * `/config` 的子命令。
+ *
+ * `set` 的值取「键之后的全部剩余文本」：`/config set systemPrompt 你是译者` 里
+ * 提示语自己带空格，不能按空白切第二刀。
+ */
+function parseConfigCommand(rest: string): ParsedInput {
+  if (rest === '') {
+    return { kind: 'config', sub: 'show' };
+  }
+
+  const separator = rest.search(/\s/);
+  const sub = (separator === -1 ? rest : rest.slice(0, separator)).toLowerCase();
+  const tail = separator === -1 ? '' : rest.slice(separator).trim();
+
+  switch (sub) {
+    case 'set': {
+      const keyEnd = tail.search(/\s/);
+      return {
+        kind: 'config',
+        sub: 'set',
+        key: keyEnd === -1 ? tail : tail.slice(0, keyEnd),
+        value: keyEnd === -1 ? '' : tail.slice(keyEnd).trim(),
+      };
+    }
+    case 'reset':
+      return { kind: 'config', sub: 'reset' };
+    case 'save':
+      return { kind: 'config', sub: 'save' };
+    default:
+      return { kind: 'config', sub: 'unknown', name: sub };
   }
 }
 
@@ -160,10 +216,11 @@ export function createShutdownHandler(deps: ShutdownDeps): ShutdownHandler {
   };
 }
 
-/** `repl` 的全部外部依赖；除 `session`/`config` 外都可注入，测试不碰真 TTY。 */
+/** `repl` 的全部外部依赖；除 `session`/`store` 外都可注入，测试不碰真 TTY。 */
 export interface ReplDeps {
   readonly session: ChatSession;
-  readonly config: AppConfig;
+  /** 会话内配置的唯一真相；`config` 每回合现取，改动下一句就生效。 */
+  readonly store: ConfigStore;
   readonly input?: NodeJS.ReadableStream;
   readonly output?: NodeJS.WritableStream;
   readonly errorOutput?: NodeJS.WritableStream;
@@ -173,6 +230,29 @@ export interface ReplDeps {
   readonly exit?: (code: number) => void;
   /** 是否打印启动横幅，默认 `true`。 */
   readonly banner?: boolean;
+  /** `/config save` 的目标文件，默认 `.env`。 */
+  readonly envFile?: string;
+  /** 写盘的注入点，默认走 `updateEnvFile(envFile, updates)`；测试换成假实现。 */
+  readonly saveEnv?: (updates: Readonly<Record<string, string | undefined>>) => Promise<EnvFileResult>;
+}
+
+/** 菜单的等待状态：等用户选编号，或等用户给某一项输入新值。 */
+type MenuState =
+  | { readonly kind: 'choice' }
+  | { readonly kind: 'value'; readonly key: MutableConfigKey };
+
+/** 把当前配置里某一项序列化成 `.env` 的取值（`undefined` 表示删掉那行）。 */
+function envValueOf(config: AppConfig, key: MutableConfigKey): string | undefined {
+  switch (key) {
+    case 'model':
+      return config.model;
+    case 'systemPrompt':
+      return config.systemPrompt;
+    case 'maxTokens':
+      return config.maxTokens === undefined ? undefined : String(config.maxTokens);
+    case 'temperature':
+      return config.temperature === undefined ? undefined : String(config.temperature);
+  }
 }
 
 /**
@@ -187,15 +267,82 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   const errorOutput = deps.errorOutput ?? process.stderr;
   const log = deps.log ?? ((): void => {});
   const exit = deps.exit ?? ((code: number): void => process.exit(code));
+  const store = deps.store;
+  const saveEnv =
+    deps.saveEnv ??
+    ((updates: Readonly<Record<string, string | undefined>>): Promise<EnvFileResult> =>
+      updateEnvFile(deps.envFile ?? '.env', updates));
 
-  const rl = createInterface({ input, output, terminal: false, crlfDelay: Infinity });
+  /**
+   * 两边都是终端时才让 readline 接管行编辑。
+   *
+   * 这里的关键不是「好看」，而是**退格到底由谁擦**：`terminal: false` 把擦除交给内核的
+   * 行规程（cooked 模式），可 stdin 是不是 cooked 由父进程决定 —— 在 raw 的 pty 里
+   * （终端复用器、IDE 任务、`script` 之类）`\x7f` 会原样送进来，表现就是「退格删不掉字」，
+   * 而且这些控制字符还会跟着正文一起发给模型。`terminal: true` 由 readline 自己解析按键，
+   * 退格、方向键、Ctrl-C 都变成它的事件，不依赖终端模式。
+   */
+  const interactive = isTty(input) && isTty(output);
 
-  // 真 TTY 会自己把输入回显出来（行规程在干活）；管道/测试里没有人回显，
-  // 由我们补一行，否则记录里只剩 `you> bot> ...` 粘在一起，读不出问了什么。
-  const echoInput = !('isTTY' in input && input.isTTY === true);
+  const rl = createInterface({
+    input,
+    output,
+    terminal: interactive,
+    crlfDelay: Infinity,
+    // ↑ 翻历史只在交互模式有意义；管道里没有按键，也不用攒。
+    historySize: interactive ? 100 : 0,
+    // 关掉 Tab 补全：聊天输入框里跳出一串 JS 标识符候选只会碍事。
+    completer: (line: string): [string[], string] => [[], line],
+  });
+
+  // 没人回显的环境（管道、测试）由我们补一行，否则记录里只剩 `you> bot> ...` 粘在一起。
+  const echoInput = !isTty(input);
 
   let inFlight: AbortController | undefined;
   let pendingTurn: Promise<unknown> | undefined;
+  /** `/config` 的两步交互状态：菜单等待中，或某一项等新值。 */
+  let menu: MenuState | undefined;
+
+  /**
+   * 画提示符。
+   *
+   * 交互模式必须走 `rl.setPrompt()` + `rl.prompt()`：readline 需要知道提示符多长，
+   * 才能在退格/方向键之后把整行重绘到正确位置。自己 `write()` 出去的话，
+   * 它不知道那一行的存在，编辑时就会把提示符一起擦掉或错位。
+   */
+  const writePrompt = (text: string = PROMPT): void => {
+    if (interactive) {
+      rl.setPrompt(text);
+      rl.prompt();
+      return;
+    }
+    output.write(text);
+  };
+
+  /**
+   * 改一项配置，并把 systemPrompt 同步给会话。
+   *
+   * 会话层的 systemPrompt 是它自己的状态（`setSystemPrompt`），不是每回合从配置读的，
+   * 所以两处必须一起推 —— 否则 `/config set systemPrompt ...` 会「改完没反应」。
+   */
+  const applyConfig = (key: MutableConfigKey, raw: string): void => {
+    try {
+      store.set(key, raw);
+    } catch (cause) {
+      if (!(cause instanceof ConfigError)) {
+        throw cause;
+      }
+      // 校验失败走 stderr，与其它错误一致：正文流只放对话内容。
+      errorOutput.write(`${renderError(cause, {}).text}\n`);
+      return;
+    }
+
+    const config = store.get();
+    if (key === 'systemPrompt') {
+      deps.session.setSystemPrompt(config.systemPrompt);
+    }
+    output.write(`${renderConfigUpdated(key, config)}\n`);
+  };
 
   const shutdown = createShutdownHandler({
     closeInput: () => rl.close(),
@@ -208,23 +355,55 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   const onSigterm = (): void => shutdown.handle('SIGTERM');
   process.on('SIGINT', onSigint);
   process.on('SIGTERM', onSigterm);
+  // 交互模式下 Ctrl-C 是 raw 按键，不会再变成信号：readline 的 'SIGINT' 事件是唯一入口。
+  rl.on('SIGINT', onSigint);
 
   if (deps.banner ?? true) {
-    output.write(`${renderBanner(deps.config)}\n`);
+    output.write(`${renderBanner(store.initial)}\n`);
   }
 
   let exitCode = EXIT_OK;
 
   try {
-    output.write(PROMPT);
+    writePrompt();
 
     // 用异步迭代而不是 `while (await rl.question())`：
     // 输入结束时 `question()` 的 promise 永不 settle（Node 实测），迭代会正常结束。
     for await (const line of rl) {
       const parsed = parseInput(line);
 
+      // 先看菜单状态：它比斜杠命令优先，否则用户输个 `2` 会被当成对话内容发出去。
+      if (menu !== undefined) {
+        if (parsed.kind === 'empty') {
+          menu = undefined;
+          output.write(`${renderConfigCancelled()}\n`);
+          writePrompt();
+          continue;
+        }
+        const answer = line.trim();
+        if (echoInput) {
+          output.write(`${answer}\n`);
+        }
+        if (menu.kind === 'choice') {
+          const outcome = readMenuChoice(answer, store);
+          if (outcome.kind === 'error') {
+            output.write(`${outcome.message}\n`);
+            writePrompt(CONFIG_MENU_PROMPT);
+            continue;
+          }
+          menu = { kind: 'value', key: outcome.key };
+          writePrompt(outcome.prompt);
+          continue;
+        }
+        const key = menu.key;
+        menu = undefined;
+        applyConfig(key, answer);
+        writePrompt();
+        continue;
+      }
+
       if (parsed.kind === 'empty') {
-        output.write(PROMPT);
+        writePrompt();
         continue;
       }
       if (echoInput) {
@@ -237,24 +416,74 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
           break;
         case 'reset':
           deps.session.reset();
-          output.write(`${renderResetDone()}\n${PROMPT}`);
+          output.write(`${renderResetDone()}\n`);
+          writePrompt();
           continue;
         case 'system':
           if (parsed.text === '') {
-            output.write(`${renderSystemUsage()}\n${PROMPT}`);
+            output.write(`${renderSystemUsage()}\n`);
+            writePrompt();
             continue;
           }
           deps.session.setSystemPrompt(parsed.text);
-          output.write(`${renderSystemUpdated(parsed.text)}\n${PROMPT}`);
+          output.write(`${renderSystemUpdated(parsed.text)}\n`);
+          writePrompt();
           continue;
         case 'history':
-          output.write(`${renderHistory(deps.session.snapshot())}\n${PROMPT}`);
+          output.write(`${renderHistory(deps.session.snapshot())}\n`);
+          writePrompt();
           continue;
         case 'help':
-          output.write(`${renderHelp()}\n${PROMPT}`);
+          output.write(`${renderHelp()}\n`);
+          writePrompt();
           continue;
+        case 'config': {
+          if (parsed.sub === 'show') {
+            output.write(`${renderConfigTable(store.get(), store.modifiedKeys())}\n`);
+            menu = { kind: 'choice' };
+            writePrompt(CONFIG_MENU_PROMPT);
+            continue;
+          }
+          if (parsed.sub === 'set') {
+            if (parsed.value === '') {
+              output.write(`${renderConfigSetUsage()}\n`);
+              writePrompt();
+              continue;
+            }
+            if (!isMutableConfigKey(parsed.key)) {
+              output.write(`${renderConfigUnknownKey(parsed.key)}\n`);
+              writePrompt();
+              continue;
+            }
+            applyConfig(parsed.key, parsed.value);
+            writePrompt();
+            continue;
+          }
+          if (parsed.sub === 'reset') {
+            store.reset();
+            deps.session.setSystemPrompt(store.get().systemPrompt);
+            output.write(`${renderConfigResetDone()}\n`);
+            writePrompt();
+            continue;
+          }
+          if (parsed.sub === 'save') {
+            const result = await saveConfig(store, saveEnv);
+            if (result !== undefined && !result.ok) {
+              errorOutput.write(`${renderConfigSaveFailed(result.message)}\n`);
+              writePrompt();
+              continue;
+            }
+            output.write(`${renderConfigSaved(result === undefined ? [] : result.changed)}\n`);
+            writePrompt();
+            continue;
+          }
+          output.write(`${renderUnknownCommand(`/config ${parsed.name}`)}\n`);
+          writePrompt();
+          continue;
+        }
         case 'unknown':
-          output.write(`${renderUnknownCommand(parsed.name)}\n${PROMPT}`);
+          output.write(`${renderUnknownCommand(parsed.name)}\n`);
+          writePrompt();
           continue;
         case 'message':
           exitCode = await runTurn(parsed.text, {
@@ -262,7 +491,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
             output,
             errorOutput,
             log,
-            config: deps.config,
+            config: store.get(),
             setInFlight: (controller, turn) => {
               inFlight = controller;
               pendingTurn = turn;
@@ -271,7 +500,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
           if (exitCode !== EXIT_OK) {
             break;
           }
-          output.write(PROMPT);
+          writePrompt();
           continue;
       }
 
@@ -281,6 +510,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     // 无论怎么结束，信号监听和 readline 都必须摘掉，否则进程不退出。
     process.off('SIGINT', onSigint);
     process.off('SIGTERM', onSigterm);
+    rl.off('SIGINT', onSigint);
     rl.close();
   }
 
@@ -329,4 +559,60 @@ function delay(ms: number): Promise<void> {
     // 这个定时器只是「别等太久」，不该把进程钉住。
     timer.unref?.();
   });
+}
+
+/** 菜单里读一行编号的结果：要么报错重来，要么进入「等这一项的新值」。 */
+type MenuOutcome =
+  | { readonly kind: 'error'; readonly message: string }
+  | { readonly kind: 'value'; readonly key: MutableConfigKey; readonly prompt: string };
+
+/**
+ * 菜单里读一行编号。
+ *
+ * 输错了不退出菜单（再给一次机会），这是菜单式交互的基本礼貌；
+ * 直接回车已经在调用方处理成「取消」。返回值不直接写输出，是为了让调用方
+ * 决定用 `writePrompt()` 还是普通 `write()` —— 交互模式下提示符必须由 readline 画。
+ */
+function readMenuChoice(answer: string, store: ConfigStore): MenuOutcome {
+  const index = Number(answer);
+  const key = Number.isInteger(index) ? MUTABLE_CONFIG_KEYS[index - 1] : undefined;
+
+  if (key === undefined) {
+    return { kind: 'error', message: renderConfigUnknownChoice(answer) };
+  }
+
+  return { kind: 'value', key, prompt: renderConfigValuePrompt(key, store.get()) };
+}
+
+/**
+ * 判断一个流是不是终端。
+ *
+ * `node:stream` 的类型里没有 `isTTY`（它属于 `tty.ReadStream`），但运行时只有
+ * 真终端才带这个属性，所以用 `in` 收窄比 `as` 干净。
+ */
+function isTty(stream: NodeJS.ReadableStream | NodeJS.WritableStream): boolean {
+  return 'isTTY' in stream && stream.isTTY === true;
+}
+
+/**
+ * `/config save`：只写「本次会话改过」的项。
+ *
+ * 返回 `undefined` 表示没有改动需要写盘（不碰文件，也不产生 `.bak`）。
+ * 故意不支持单个项的保存：手写 `.env` 的价值就是「一次想清楚再落盘」。
+ */
+async function saveConfig(
+  store: ConfigStore,
+  saveEnv: (updates: Readonly<Record<string, string | undefined>>) => Promise<EnvFileResult>,
+): Promise<EnvFileResult | undefined> {
+  const keys = store.modifiedKeys();
+  if (keys.length === 0) {
+    return undefined;
+  }
+
+  const config = store.get();
+  const updates: Record<string, string | undefined> = {};
+  for (const key of keys) {
+    updates[MUTABLE_CONFIG_ENV_VARS[key]] = envValueOf(config, key);
+  }
+  return saveEnv(updates);
 }
