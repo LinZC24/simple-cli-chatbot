@@ -40,6 +40,15 @@ function advance(seconds) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 按固定宽度切块：模拟模型逐字吐字（按字符切，中文也不会碎）。 */
+function pieces(text, width) {
+  const out = [];
+  for (let i = 0; i < text.length; i += width) {
+    out.push(text.slice(i, i + width));
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // 假服务器：第一次 429（带 Retry-After），之后按 messages 的条数回答，
 // 这样录像里能直接看出「上下文在增长」。
@@ -73,15 +82,39 @@ function startFakeOpenAi() {
       const messages = parsed.messages;
       const userTurns = messages.filter((message) => message.role === 'user');
       const last = userTurns.at(-1);
+      const reasoning = `先数一下上下文：共 ${messages.length} 条消息，其中用户发言 ${userTurns.length} 次。`;
       const reply = `第 ${userTurns.length} 轮：我看到了 ${messages.length} 条消息（含 system），你刚说的是「${last.content}」。`;
 
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          choices: [{ message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 12, completion_tokens: 24, total_tokens: 36 },
-        }),
-      );
+      // 回 SSE：录出来的画面才有「思维链逐字、正文逐字」的可看性。
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      });
+
+      const send = (delta) => {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`);
+      };
+
+      void (async () => {
+        for (const piece of pieces(reasoning, 6)) {
+          send({ reasoning_content: piece });
+          await sleep(40);
+        }
+        for (const piece of pieces(reply, 5)) {
+          send({ content: piece });
+          await sleep(30);
+        }
+        send({});
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 12, completion_tokens: 24, total_tokens: 36 },
+          })}\n\n`,
+        );
+        res.write('data: [DONE]\n\n');
+        res.end();
+      })();
     });
   });
 

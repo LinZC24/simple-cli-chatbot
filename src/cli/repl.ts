@@ -28,7 +28,9 @@ import { ConfigError, UserAbortError } from '../http/errors.js';
 import type { ChatSession } from '../session/chat-session.js';
 import {
   CONFIG_MENU_PROMPT,
+  NO_REASONING_HINT,
   PROMPT,
+  createReplyStream,
   renderBanner,
   renderConfigCancelled,
   renderConfigResetDone,
@@ -47,6 +49,8 @@ import {
   renderResetDone,
   renderSystemUpdated,
   renderSystemUsage,
+  renderThinkToggle,
+  renderThinkUsage,
   renderUnknownCommand,
   renderUsage,
 } from './render.js';
@@ -75,6 +79,7 @@ export type ParsedInput =
   | { readonly kind: 'config'; readonly sub: 'reset' }
   | { readonly kind: 'config'; readonly sub: 'save' }
   | { readonly kind: 'config'; readonly sub: 'unknown'; readonly name: string }
+  | { readonly kind: 'think'; readonly mode: 'on' | 'off' | 'status' | 'unknown' }
   | { readonly kind: 'unknown'; readonly name: string }
   | { readonly kind: 'message'; readonly text: string };
 
@@ -111,6 +116,13 @@ export function parseInput(line: string): ParsedInput {
       return { kind: 'help' };
     case '/config':
       return parseConfigCommand(rest);
+    case '/think': {
+      const mode = rest.toLowerCase();
+      if (mode === 'on' || mode === 'off') {
+        return { kind: 'think', mode };
+      }
+      return { kind: 'think', mode: mode === '' ? 'status' : 'unknown' };
+    }
     default:
       return { kind: 'unknown', name };
   }
@@ -302,6 +314,10 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   let pendingTurn: Promise<unknown> | undefined;
   /** `/config` 的两步交互状态：菜单等待中，或某一项等新值。 */
   let menu: MenuState | undefined;
+  /** 思维链显示开关（默认开）；关掉时整包请求，回答一次给出。 */
+  let thinkEnabled = true;
+  /** 「这个模型不给思维链」只提示一次，否则每回合都刷一行。 */
+  let reasoningHintShown = false;
 
   /**
    * 画提示符。
@@ -433,6 +449,22 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
           output.write(`${renderHistory(deps.session.snapshot())}\n`);
           writePrompt();
           continue;
+        case 'think':
+          if (parsed.mode === 'unknown') {
+            output.write(`${renderThinkUsage()}\n`);
+            writePrompt();
+            continue;
+          }
+          if (parsed.mode !== 'status') {
+            thinkEnabled = parsed.mode === 'on';
+            // 重新开启时再给模型一次机会：换模型/换接口后确实可能就带思维链了。
+            if (thinkEnabled) {
+              reasoningHintShown = false;
+            }
+          }
+          output.write(`${renderThinkToggle(thinkEnabled)}\n`);
+          writePrompt();
+          continue;
         case 'help':
           output.write(`${renderHelp()}\n`);
           writePrompt();
@@ -492,6 +524,19 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
             errorOutput,
             log,
             config: store.get(),
+            think: {
+              enabled: thinkEnabled,
+              // 只有真终端才上色：管道与录像里的 ANSI 序列是噪音。
+              color: interactive,
+              shouldHintMissing: () => {
+                // 只在真终端里提示：重定向到文件时没人看直播，「提示关掉实时显示」只是噪音。
+                if (!interactive || !thinkEnabled || reasoningHintShown) {
+                  return false;
+                }
+                reasoningHintShown = true;
+                return true;
+              },
+            },
             setInFlight: (controller, turn) => {
               inFlight = controller;
               pendingTurn = turn;
@@ -523,28 +568,71 @@ interface TurnContext {
   readonly errorOutput: NodeJS.WritableStream;
   readonly log: (message: string) => void;
   readonly config: AppConfig;
+  readonly think: ThinkContext;
   readonly setInFlight: (controller: AbortController | undefined, turn: Promise<unknown> | undefined) => void;
+}
+
+/** 思维链渲染的开关（由 `/think` 命令驱动）。 */
+interface ThinkContext {
+  /** 关掉时不传 `onDelta`，于是退化成整包请求。 */
+  readonly enabled: boolean;
+  /** 是否给 `think>` 行上暗淡色。 */
+  readonly color: boolean;
+  /** 模型没给思维链时要不要提示；返回 `true` 才提示（每次会话只一次）。 */
+  readonly shouldHintMissing: () => boolean;
 }
 
 /**
  * 跑一个回合：成功后打印 `bot> ...`，失败只渲染不重试。
  *
+ * 开了思维链时走流式：`onDelta` 里收到的每一个增量都立即写出去，所以用户看到的是
+ * 「先 think> 逐字、再 bot> 逐字」；`finish()` 负责关行、补空回复占位与截断提示。
+ * 关掉时（或不支持流的模型）依然是一次性 `renderReply`。
+ *
  * 返回非 0 表示「该收尾了」（用户取消了本回合）。
  */
 async function runTurn(text: string, context: TurnContext): Promise<number> {
   const controller = new AbortController();
-  const turn = context.session.turn(text, { signal: controller.signal });
+  const stream = context.think.enabled ? createReplyStream({ color: context.think.color }) : undefined;
+
+  const turn = context.session.turn(
+    text,
+    stream === undefined
+      ? { signal: controller.signal }
+      : {
+          signal: controller.signal,
+          onDelta: (delta) => {
+            const chunk = stream.push(delta);
+            if (chunk !== '') {
+              context.output.write(chunk);
+            }
+          },
+        },
+  );
   context.setInFlight(controller, turn);
 
   try {
     const result = await turn;
-    context.output.write(`${renderReply(result)}\n`);
+
+    if (stream === undefined) {
+      context.output.write(`${renderReply(result)}\n`);
+    } else {
+      context.output.write(stream.finish(result));
+      // 一个思维链都没收到：提示一次，并告诉用户能关。
+      if (!stream.sawReasoning && context.think.shouldHintMissing()) {
+        context.output.write(`${NO_REASONING_HINT}\n`);
+      }
+    }
 
     if (context.config.logLevel === 'debug' && result.assistant.usage !== undefined) {
       context.log(renderUsage(result.assistant.usage));
     }
     return EXIT_OK;
   } catch (cause) {
+    // 半截输出已经写在屏幕上了，这里只补一个换行，不假装那行不存在。
+    if (stream !== undefined) {
+      context.output.write('\n');
+    }
     context.errorOutput.write(`${renderError(cause, { retries: context.config.maxRetries, timeoutMs: context.config.timeoutMs }).text}\n`);
     // 用户自己取消的回合不继续问下一句，直接走去退出流程。
     return cause instanceof UserAbortError ? EXIT_CANCELLED : EXIT_OK;

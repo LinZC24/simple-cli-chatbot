@@ -8,6 +8,7 @@ import {
   createLlmClient,
   isChatCompletionResponse,
   type TransportRequest,
+  type TransportStreamRequest,
 } from '../src/llm/llm-client.js';
 import type { ChatMessage } from '../src/llm/types.js';
 import { startFlakyServer } from './helpers/flaky-server.js';
@@ -405,5 +406,157 @@ describe('协议层与传输层串联', () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 流式路径（`onDelta` + `streamTransport`）
+// ---------------------------------------------------------------------------
+
+interface StreamCall {
+  readonly url: string;
+  readonly payload: unknown;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+/** 把若干 `data:` 负荷拼成一段 SSE 文本流（一次给完整块，跨块切分由 sse 测试覆盖）。 */
+async function* sseChunks(payloads: readonly string[]): AsyncIterable<string> {
+  for (const payload of payloads) {
+    yield `data: ${payload}\n\n`;
+  }
+}
+
+function createFakeStreamTransport(
+  payloads: readonly string[],
+): { streamTransport: TransportStreamRequest; calls: StreamCall[] } {
+  const calls: StreamCall[] = [];
+  const streamTransport: TransportStreamRequest = (url, payload, headers) => {
+    calls.push({ url, payload, headers });
+    return Promise.resolve({ status: 200, headers: new Headers(), chunks: sseChunks(payloads) });
+  };
+  return { streamTransport, calls };
+}
+
+function chunkOf(delta: Record<string, unknown>, finishReason?: string): string {
+  const choice: Record<string, unknown> = { index: 0, delta };
+  if (finishReason !== undefined) {
+    choice.finish_reason = finishReason;
+  }
+  return JSON.stringify({ id: 'chatcmpl-x', object: 'chat.completion.chunk', choices: [choice] });
+}
+
+describe('流式：增量上报与聚合', () => {
+  it('思维链与正文分别上报，聚合后的 message 两者都留', async () => {
+    const { streamTransport, calls } = createFakeStreamTransport([
+      chunkOf({ role: 'assistant', reasoning_content: '先算 ' }),
+      chunkOf({ reasoning_content: '9.9 - 9.11' }),
+      chunkOf({ content: '9.9 ' }),
+      chunkOf({ content: '更大' }),
+      chunkOf({}, 'stop'),
+      '[DONE]',
+    ]);
+    const client = createLlmClient({ config: () => config, transport: postJson, streamTransport });
+    const deltas: string[] = [];
+
+    const message = await client.chat(MESSAGES, {
+      onDelta: (delta) => deltas.push(`${delta.kind}:${delta.text}`),
+    });
+
+    expect(deltas).toEqual(['reasoning:先算 ', 'reasoning:9.9 - 9.11', 'content:9.9 ', 'content:更大']);
+    expect(message.content).toBe('9.9 更大');
+    expect(message.reasoning).toBe('先算 9.9 - 9.11');
+    expect(message.finishReason).toBe('stop');
+
+    const payload = calls[0]?.payload as Record<string, unknown>;
+    expect(payload.stream).toBe(true);
+    expect(payload.stream_options).toEqual({ include_usage: true });
+  });
+
+  it('`reasoning` 字段名也认（不同家叫法不同）', async () => {
+    const { streamTransport } = createFakeStreamTransport([chunkOf({ reasoning: '想一想' }), '[DONE]']);
+    const client = createLlmClient({ config: () => config, transport: postJson, streamTransport });
+    const kinds: string[] = [];
+
+    const message = await client.chat(MESSAGES, { onDelta: (delta) => kinds.push(delta.kind) });
+
+    expect(kinds).toEqual(['reasoning']);
+    expect(message.reasoning).toBe('想一想');
+    expect(message.content).toBe('');
+  });
+
+  it('收尾帧只带 usage：不上报空 delta，用量写进结果', async () => {
+    const { streamTransport } = createFakeStreamTransport([
+      chunkOf({ content: '好' }, 'stop'),
+      JSON.stringify({
+        id: 'chatcmpl-x',
+        choices: [],
+        usage: { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 },
+      }),
+      '[DONE]',
+    ]);
+    const client = createLlmClient({ config: () => config, transport: postJson, streamTransport });
+    const deltas: string[] = [];
+
+    const message = await client.chat(MESSAGES, { onDelta: (delta) => deltas.push(delta.text) });
+
+    expect(deltas).toEqual(['好']);
+    expect(message.usage).toEqual({ promptTokens: 7, completionTokens: 2, totalTokens: 9 });
+  });
+
+  it('一个帧都没有：响应形状错误', async () => {
+    const { streamTransport } = createFakeStreamTransport(['[DONE]']);
+    const client = createLlmClient({ config: () => config, transport: postJson, streamTransport });
+
+    await expect(client.chat(MESSAGES, { onDelta: () => {} })).rejects.toBeInstanceOf(ResponseShapeError);
+  });
+
+  it('delta.content 不是字符串：报形状错误而不是静默丢掉', async () => {
+    const { streamTransport } = createFakeStreamTransport([chunkOf({ content: 42 })]);
+    const client = createLlmClient({ config: () => config, transport: postJson, streamTransport });
+
+    await expect(client.chat(MESSAGES, { onDelta: () => {} })).rejects.toBeInstanceOf(ResponseShapeError);
+  });
+
+  it('流里出现 error 载荷：报形状错误（附上原始负荷）', async () => {
+    const { streamTransport } = createFakeStreamTransport([
+      JSON.stringify({ error: { message: 'overloaded', type: 'server_error' } }),
+    ]);
+    const client = createLlmClient({ config: () => config, transport: postJson, streamTransport });
+
+    await expect(client.chat(MESSAGES, { onDelta: () => {} })).rejects.toThrow(/error payload/);
+  });
+
+  it('没有 finish_reason 时回落 unknown，而不是当成错误', async () => {
+    const { streamTransport } = createFakeStreamTransport([chunkOf({ content: '半句' })]);
+    const client = createLlmClient({ config: () => config, transport: postJson, streamTransport });
+
+    const message = await client.chat(MESSAGES, { onDelta: () => {} });
+
+    expect(message.finishReason).toBe('unknown');
+  });
+
+  it('没要增量时即使接了流式通道也走整包请求（stream: false）', async () => {
+    const { transport, calls } = createFakeTransport(okBody());
+    const { streamTransport, calls: streamCalls } = createFakeStreamTransport([chunkOf({ content: '不该出现' })]);
+    const client = createLlmClient({ config: () => config, transport, streamTransport });
+
+    const message = await client.chat(MESSAGES);
+
+    expect(message.content).toBe('你好呀');
+    expect(streamCalls).toHaveLength(0);
+    expect((calls[0]?.payload as Record<string, unknown>).stream).toBe(false);
+  });
+
+  it('没有流式通道时把整包结果当成一帧上报', async () => {
+    const { transport } = createFakeTransport(
+      okBody({ choices: [{ message: { content: '整包', reasoning_content: '先想' }, finish_reason: 'stop' }] }),
+    );
+    const client = createLlmClient({ config: () => config, transport });
+    const deltas: string[] = [];
+
+    const message = await client.chat(MESSAGES, { onDelta: (delta) => deltas.push(`${delta.kind}:${delta.text}`) });
+
+    expect(deltas).toEqual(['reasoning:先想', 'content:整包']);
+    expect(message.reasoning).toBe('先想');
   });
 });

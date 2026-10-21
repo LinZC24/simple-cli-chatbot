@@ -14,7 +14,7 @@
 
 import { DEFAULT_MAX_HISTORY_MESSAGES } from '../config.js';
 import type { LlmClient } from '../llm/llm-client.js';
-import type { AssistantMessage, ChatMessage } from '../llm/types.js';
+import type { AssistantMessage, ChatDelta, ChatMessage } from '../llm/types.js';
 
 export interface TurnResult {
   readonly assistant: AssistantMessage;
@@ -26,6 +26,13 @@ export interface TurnResult {
 
 export interface TurnOptions {
   readonly signal?: AbortSignal;
+  /**
+   * 增量回调，原样透传给 LLM 客户端（`ChatOptions`）。
+   *
+   * 会话层不看它的内容、不拿它拼历史 —— 只负责让它穿过去，
+   * 保证「事务式提交」的边界不受流式影响。
+   */
+  readonly onDelta?: (delta: ChatDelta) => void;
 }
 
 export interface ChatSession {

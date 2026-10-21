@@ -24,7 +24,7 @@ import { loadConfig } from '../src/config.js';
 import { createConfigStore, type ConfigStore } from '../src/config-store.js';
 import type { EnvFileResult } from '../src/env-file.js';
 import { AuthError, UserAbortError } from '../src/http/errors.js';
-import type { AssistantMessage, ChatMessage } from '../src/llm/types.js';
+import type { AssistantMessage, ChatDelta, ChatMessage } from '../src/llm/types.js';
 import { createChatSession, type ChatSession } from '../src/session/chat-session.js';
 import type { LlmClient } from '../src/llm/llm-client.js';
 
@@ -38,14 +38,18 @@ async function tick(): Promise<void> {
 }
 
 /** 记录写入内容的可写流。 */
-function collector(): { stream: Writable; text: () => string } {
+function collector(tty = false): { stream: Writable; text: () => string } {
   const chunks: string[] = [];
-  const stream = new Writable({
-    write(chunk: unknown, _encoding, callback) {
-      chunks.push(String(chunk));
-      callback();
-    },
-  });
+  const stream = Object.assign(
+    new Writable({
+      write(chunk: unknown, _encoding, callback) {
+        chunks.push(String(chunk));
+        callback();
+      },
+    }),
+    // 假装自己是终端：渲染层据此决定要不要上色、要不要给「没有思维链」的提示。
+    { isTTY: tty },
+  );
   return { stream, text: () => chunks.join('') };
 }
 
@@ -83,13 +87,16 @@ interface RunOptions {
   readonly store?: ConfigStore;
   readonly exit?: (code: number) => void;
   readonly saveEnv?: (updates: Readonly<Record<string, string | undefined>>) => Promise<EnvFileResult>;
+  /** 把 stdin/stdout 伪装成终端（影响上色与「没有思维链」提示）。 */
+  readonly tty?: boolean;
 }
 
 async function run(lines: readonly string[], options: RunOptions = {}): Promise<ReplRun> {
   const session = options.session ?? makeSession().session;
-  const input = new PassThrough();
-  const out = collector();
-  const err = collector();
+  const tty = options.tty === true;
+  const input = Object.assign(new PassThrough(), { isTTY: tty });
+  const out = collector(tty);
+  const err = collector(tty);
 
   const done = runRepl({
     session,
@@ -628,5 +635,139 @@ describe('runRepl：/config', () => {
     expect(parseInput('/config SET Model gpt-4.1')).toEqual({ kind: 'config', sub: 'set', key: 'Model', value: 'gpt-4.1' });
     expect(parseInput('/config set systemPrompt a b  c')).toEqual({ kind: 'config', sub: 'set', key: 'systemPrompt', value: 'a b  c' });
     expect(parseInput('/config wat')).toEqual({ kind: 'config', sub: 'unknown', name: 'wat' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 思维链：`/think` 开关与流式渲染
+// ---------------------------------------------------------------------------
+
+/** 假会话：把预设增量依次推给 `onDelta`，再返回拼好的最终消息。 */
+function makeStreamSession(parts: readonly ChatDelta[]): { session: ChatSession; seenDeltas: number } {
+  const state = { seenDeltas: 0 };
+  const llm: LlmClient = {
+    async chat(_messages, opts) {
+      // 没要增量（`/think off`）时一次都不上报，模拟整包请求的模型。
+      const emit = opts?.onDelta;
+      if (emit !== undefined) {
+        for (const part of parts) {
+          state.seenDeltas += 1;
+          emit(part);
+        }
+      }
+      const content = parts
+        .filter((part) => part.kind === 'content')
+        .map((part) => part.text)
+        .join('');
+      const reasoning = parts
+        .filter((part) => part.kind === 'reasoning')
+        .map((part) => part.text)
+        .join('');
+      return {
+        role: 'assistant',
+        content,
+        finishReason: 'stop',
+        ...(reasoning === '' ? {} : { reasoning }),
+      };
+    },
+  };
+  return {
+    session: createChatSession({ llm, systemPrompt: '你是助手', maxHistoryMessages: 40 }),
+    // 读的是同一份状态：回合跑完之后再读才拿得到真实次数。
+    get seenDeltas() {
+      return state.seenDeltas;
+    },
+  };
+}
+
+describe('/think', () => {
+  it('三个分支都解析得出来，非法参数单独一类', () => {
+    expect(parseInput('/think')).toEqual({ kind: 'think', mode: 'status' });
+    expect(parseInput('/think on')).toEqual({ kind: 'think', mode: 'on' });
+    expect(parseInput('/think OFF')).toEqual({ kind: 'think', mode: 'off' });
+    expect(parseInput('/think maybe')).toEqual({ kind: 'think', mode: 'unknown' });
+  });
+
+  it('默认开着；关掉后回执说明「整包请求」，再问状态也是关', async () => {
+    const result = await run(['/think', '/think off', '/think']);
+
+    expect(result.stdout).toContain('思维链显示：开');
+    expect(result.stdout).toContain('思维链显示：关');
+    expect(result.stdout).toContain('整包请求');
+  });
+
+  it('非法参数给用法，不改变当前状态', async () => {
+    const result = await run(['/think maybe', '/think']);
+
+    expect(result.stdout).toContain('用法：/think on');
+    expect(result.stdout).toContain('思维链显示：开');
+  });
+
+  it('开着时增量逐块写出：先 think> 再 bot>', async () => {
+    const harness = makeStreamSession([
+      { kind: 'reasoning', text: '先比较整数部分' },
+      { kind: 'reasoning', text: '，再看小数位' },
+      { kind: 'content', text: '9.9 更大' },
+    ]);
+
+    const result = await run(['9.11 和 9.9 哪个大'], { session: harness.session });
+
+    expect(result.stdout).toContain('think> 先比较整数部分，再看小数位');
+    expect(result.stdout).toContain('bot> 9.9 更大');
+    // 正文与思维链是分开的两行，不该粘在一起。
+    expect(result.stdout).toContain('，再看小数位\nbot> 9.9 更大');
+  });
+
+  it('关掉之后不再传 onDelta，结果一次性打印', async () => {
+    const harness = makeStreamSession([{ kind: 'content', text: '整包回答' }]);
+
+    const result = await run(['/think off', '问题'], { session: harness.session });
+
+    expect(harness.seenDeltas).toBe(0);
+    expect(result.stdout).toContain('bot> 整包回答');
+    expect(result.stdout).not.toContain('think>');
+  });
+
+  it('模型不给思维链时，真终端里提示一次就够', async () => {
+    const harness = makeStreamSession([{ kind: 'content', text: '直接回答' }]);
+
+    const result = await run(['第一句', '第二句'], { session: harness.session, tty: true });
+
+    const hints = result.stdout.split('/think off').length - 1;
+    expect(hints).toBe(1);
+  });
+
+  it('非终端不提示（重定向到文件时没人看直播）', async () => {
+    const harness = makeStreamSession([{ kind: 'content', text: '直接回答' }]);
+
+    const result = await run(['第一句'], { session: harness.session });
+
+    expect(result.stdout).not.toContain('/think off');
+  });
+
+  it('开着时真终端给 think> 加上暗淡色，管道里不给', async () => {
+    const harness = makeStreamSession([{ kind: 'reasoning', text: '想法' }]);
+
+    const tty = await run(['问题'], { session: harness.session, tty: true });
+    const piped = await run(['问题'], { session: harness.session });
+
+    expect(tty.stdout).toContain('\u001b[2m');
+    expect(piped.stdout).not.toContain('\u001b[2m');
+  });
+
+  it('流到一半失败：已输出的字保留，错误仍走 stderr', async () => {
+    const llm: LlmClient = {
+      async chat(_messages, opts) {
+        opts?.onDelta?.({ kind: 'reasoning', text: '想到一半' });
+        throw new AuthError({ status: 401 });
+      },
+    };
+    const session = createChatSession({ llm, systemPrompt: '你是助手', maxHistoryMessages: 40 });
+
+    const result = await run(['问题'], { session });
+
+    expect(result.stdout).toContain('think> 想到一半');
+    expect(result.stderr).toContain('鉴权失败');
+    expect(result.code).toBe(EXIT_OK);
   });
 });

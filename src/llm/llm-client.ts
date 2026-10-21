@@ -13,8 +13,16 @@
 import type { AppConfig } from '../config.js';
 import { ResponseShapeError } from '../http/errors.js';
 import { DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_DELAY_MS, DEFAULT_MAX_RETRY_AFTER_MS } from '../http/retry.js';
-import type { JsonResponse, RetryLogEvent, TransportOptions } from '../http/transport.js';
-import type { AssistantMessage, ChatCompletionRequest, ChatMessage, FinishReason, Usage } from './types.js';
+import type { JsonResponse, RetryLogEvent, StreamResponse, TransportOptions } from '../http/transport.js';
+import { parseSseStream } from './sse.js';
+import type {
+  AssistantMessage,
+  ChatCompletionRequest,
+  ChatDelta,
+  ChatMessage,
+  FinishReason,
+  Usage,
+} from './types.js';
 
 /**
  * 传输层注入点。
@@ -29,6 +37,19 @@ export type TransportRequest = (
   options: TransportOptions,
 ) => Promise<JsonResponse<unknown>>;
 
+/**
+ * 流式传输注入点，结构上与 `postSse` 一致。
+ *
+ * 不设成必填：不注它的时候 `chat` 走整包 JSON，把内容当成一个 delta 交出去 ——
+ * 上层（会话层 / CLI）只写一份逻辑，不用为「流不流」分叉。
+ */
+export type TransportStreamRequest = (
+  url: string,
+  payload: unknown,
+  headers: Readonly<Record<string, string>>,
+  options: TransportOptions,
+) => Promise<StreamResponse>;
+
 export interface LlmClientDeps {
   /**
    * 配置**读取器**而不是配置本身：`/config` 可以在会话内改 model / maxTokens / temperature，
@@ -36,12 +57,20 @@ export interface LlmClientDeps {
    */
   readonly config: () => AppConfig;
   readonly transport: TransportRequest;
+  /** 流式通道（`postSse`）。不注入时退化成整包请求。 */
+  readonly streamTransport?: TransportStreamRequest;
   /** 重试日志回调：`[retry] attempt 1 failed: ServerError 500, retrying in 512ms (backoff)`。 */
   readonly log?: (message: string) => void;
 }
 
 export interface ChatOptions {
   readonly signal?: AbortSignal;
+  /**
+   * 增量回调：给了就尽量走流式（思维链与正文分开上报）。
+   *
+   * 回调抛错不算协议错误 —— 那是渲染层的问题，这里不拦。
+   */
+  readonly onDelta?: (delta: ChatDelta) => void;
 }
 
 export interface LlmClient {
@@ -121,14 +150,16 @@ function describeBody(body: unknown): string {
 }
 
 /** 构造请求体。可选字段「没配置就不产生该字段」，与配置层的口径保持一致。 */
-function buildPayload(config: AppConfig, messages: readonly ChatMessage[]): ChatCompletionRequest {
+function buildPayload(config: AppConfig, messages: readonly ChatMessage[], stream: boolean): ChatCompletionRequest {
   return {
     model: config.model,
     // 拷贝一份：调用方随后改动自己的数组也不该影响「已经发出的请求」。
     messages: [...messages],
-    stream: false,
+    stream,
     ...(config.maxTokens === undefined ? {} : { max_tokens: config.maxTokens }),
     ...(config.temperature === undefined ? {} : { temperature: config.temperature }),
+    // 只要流式，就要用量：否则 debug 日志里永远没有 token 数。
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
   };
 }
 
@@ -162,32 +193,232 @@ function formatRetryEvent(event: RetryLogEvent): string {
   return `[retry] attempt ${event.attempt} failed: ${event.errorName}${status}, retrying in ${event.delayMs}ms (${event.reason})`;
 }
 
+/** 流式里一帧的 wire 形状：`choices[0].delta`，最后一帧带 `finish_reason`。 */
+interface ChatCompletionChunk {
+  readonly choices?: readonly unknown[];
+  readonly usage?: unknown;
+  readonly error?: unknown;
+}
+
+/**
+ * 读一段 `delta` 字段：思维链可能叫 `reasoning_content`（DeepSeek）或 `reasoning`（其它家）。
+ *
+ * `null` 当作没有（有些服务端会显式发 `"content": null`）；数字/对象则算形状错误 ——
+ * 默默忽略会让「模型回复被吞掉」变成一个查不出来的 bug。
+ */
+function readDeltaText(delta: Record<string, unknown>, field: 'content' | 'reasoning_content' | 'reasoning'): string | undefined {
+  const value = delta[field];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    throw new ResponseShapeError(`stream delta.${field} is not a string`, { body: describeBody(delta) });
+  }
+  return value === '' ? undefined : value;
+}
+
+/**
+ * 把一帧 chunk 翻成增量，并累加器装上思维链 / 正文 / 结束原因 / 用量。
+ *
+ * 一个 chunk 理论上可以同时带思维链与正文（切换到回答的那一帧），所以两个 `onDelta`
+ * 先后上报而不互斥。
+ */
+function applyChunk(
+  chunk: ChatCompletionChunk,
+  state: { content: string; reasoning: string; finishReason: FinishReason | undefined; usage: Usage | undefined },
+  onDelta: (delta: ChatDelta) => void,
+): void {
+  const usage = readUsage(chunk.usage);
+  if (usage !== undefined) {
+    state.usage = usage;
+  }
+
+  const { choices } = chunk;
+  if (!Array.isArray(choices) || choices.length === 0) {
+    // 只带 usage 的收尾帧就属于这种：合法，不再往下读。
+    return;
+  }
+
+  const first: unknown = choices[0];
+  if (!isRecord(first)) {
+    throw new ResponseShapeError('stream choices[0] is not an object', { body: describeBody(chunk) });
+  }
+
+  const finishReason = readFinishReasonOrUndefined(first.finish_reason);
+  if (finishReason !== undefined) {
+    state.finishReason = finishReason;
+  }
+
+  const rawDelta = first.delta;
+  if (rawDelta === undefined) {
+    return;
+  }
+  if (!isRecord(rawDelta)) {
+    throw new ResponseShapeError('stream choices[0].delta is not an object', { body: describeBody(chunk) });
+  }
+
+  const reasoning = readDeltaText(rawDelta, 'reasoning_content') ?? readDeltaText(rawDelta, 'reasoning');
+  if (reasoning !== undefined) {
+    state.reasoning += reasoning;
+    onDelta({ kind: 'reasoning', text: reasoning });
+  }
+
+  const content = readDeltaText(rawDelta, 'content');
+  if (content !== undefined) {
+    state.content += content;
+    onDelta({ kind: 'content', text: content });
+  }
+}
+
+function readFinishReasonOrUndefined(value: unknown): FinishReason | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+/** 一个 `data:` 负荷。`[DONE]` 是 OpenAI 系的收尾哨兵，不是 JSON。 */
+function parseSsePayload(data: string, url: string): ChatCompletionChunk | 'done' {
+  if (data === '[DONE]') {
+    return 'done';
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    throw new ResponseShapeError('stream chunk is not valid JSON', { body: data, meta: { url } });
+  }
+
+  if (!isRecord(parsed)) {
+    throw new ResponseShapeError('stream chunk is not an object', { body: data, meta: { url } });
+  }
+
+  // 有的服务端在过载时用一帧 `{"error": ...}` 代替正常帧：这不是命令错误，
+  // 而是上游在罢工，归入服务端错误更诚实（且不会重试起步式的多次请求）。
+  if (parsed.error !== undefined) {
+    throw new ResponseShapeError('stream reported an error payload', {
+      body: describeBody(parsed.error),
+      meta: { url },
+    });
+  }
+
+  return parsed;
+}
+
+/**
+ * 消完整个 SSE 流，返回聚合后的 `AssistantMessage`。
+ *
+ * 边界：
+ * - `[DONE]` 提前结束（不依赖服务端关连接）；
+ * - 流里一个帧都没有 → 响应形状错误（多半是网关把流吃了）；
+ * - 只有思维链没有正文 → 合法（模型被 `length` 截断在思考阶段），交给渲染层处理。
+ */
+async function readChatStream(
+  chunks: AsyncIterable<string>,
+  url: string,
+  onDelta: (delta: ChatDelta) => void,
+): Promise<AssistantMessage> {
+  const state: {
+    content: string;
+    reasoning: string;
+    finishReason: FinishReason | undefined;
+    usage: Usage | undefined;
+  } = { content: '', reasoning: '', finishReason: undefined, usage: undefined };
+  let frames = 0;
+
+  for await (const event of parseSseStream(chunks)) {
+    const chunk = parseSsePayload(event.data, url);
+    if (chunk === 'done') {
+      break;
+    }
+    frames += 1;
+    applyChunk(chunk, state, onDelta);
+  }
+
+  if (frames === 0) {
+    throw new ResponseShapeError('stream contains no chunk', { meta: { url } });
+  }
+
+  return {
+    role: 'assistant',
+    content: state.content,
+    finishReason: state.finishReason ?? UNKNOWN_FINISH_REASON,
+    ...(state.usage === undefined ? {} : { usage: state.usage }),
+    ...(state.reasoning === '' ? {} : { reasoning: state.reasoning }),
+  };
+}
+
 export function createLlmClient(deps: LlmClientDeps): LlmClient {
-  const { transport } = deps;
+  const { transport, streamTransport } = deps;
 
   return {
     async chat(messages, opts) {
       const config = deps.config();
       const url = `${config.baseUrl}${CHAT_COMPLETIONS_PATH}`;
-      const response = await transport(url, buildPayload(config, messages), buildHeaders(config), buildTransportOptions(config, deps.log, opts));
+      const onDelta = opts?.onDelta;
+      const transportOptions = buildTransportOptions(config, deps.log, opts);
 
-      const body = response.body;
-      if (!isChatCompletionResponse(body)) {
-        throw new ResponseShapeError('missing choices[0].message.content', {
-          body: describeBody(body),
-          meta: { status: response.status, url },
-        });
+      // 没要增量、或没接流式通道：整包请求，把结果当成一个 delta 交出去。
+      if (onDelta === undefined || streamTransport === undefined) {
+        const response = await transport(
+          url,
+          buildPayload(config, messages, false),
+          buildHeaders(config),
+          transportOptions,
+        );
+        const message = readResponse(response, url);
+        emitMessage(onDelta, message);
+        return message;
       }
 
-      const [choice] = body.choices;
-      const usage = readUsage(body.usage);
-
-      return {
-        role: 'assistant',
-        content: choice.message.content,
-        finishReason: readFinishReason(choice.finish_reason),
-        ...(usage === undefined ? {} : { usage }),
-      };
+      const response = await streamTransport(
+        url,
+        buildPayload(config, messages, true),
+        buildHeaders(config),
+        transportOptions,
+      );
+      return readChatStream(response.chunks, url, onDelta);
     },
   };
+}
+
+/** 整包响应退化成流式上报：把结果当成一两帧交出去，上层不用为「流不流」分叉。 */
+function emitMessage(onDelta: ((delta: ChatDelta) => void) | undefined, message: AssistantMessage): void {
+  if (onDelta === undefined) {
+    return;
+  }
+  if (message.reasoning !== undefined) {
+    onDelta({ kind: 'reasoning', text: message.reasoning });
+  }
+  onDelta({ kind: 'content', text: message.content });
+}
+
+/** 整包 JSON 路径的读出：形状校验 + 翻成 `AssistantMessage`。 */
+function readResponse(response: JsonResponse<unknown>, url: string): AssistantMessage {
+  const body = response.body;
+  if (!isChatCompletionResponse(body)) {
+    throw new ResponseShapeError('missing choices[0].message.content', {
+      body: describeBody(body),
+      meta: { status: response.status, url },
+    });
+  }
+
+  const [choice] = body.choices;
+  const usage = readUsage(body.usage);
+  const reasoning = readNonStreamingReasoning(choice.message);
+
+  return {
+    role: 'assistant',
+    content: choice.message.content,
+    finishReason: readFinishReason(choice.finish_reason),
+    ...(usage === undefined ? {} : { usage }),
+    ...(reasoning === undefined ? {} : { reasoning }),
+  };
+}
+
+/** 非流式响应里的思维链（DeepSeek 的 `reasoning_content`）—— 只用于展示。 */
+function readNonStreamingReasoning(message: unknown): string | undefined {
+  if (!isRecord(message)) {
+    return undefined;
+  }
+  const value = message.reasoning_content ?? message.reasoning;
+  return typeof value === 'string' && value !== '' ? value : undefined;
 }

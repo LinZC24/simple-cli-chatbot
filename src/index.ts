@@ -3,7 +3,7 @@
  *
  * 这一层刻意只做**连接**，不写业务：
  * - `loadConfig` 是唯一的读环境变量处，配置错误在这里就被拦下（退出码 1）；
- * - `postJson` 是唯一碰 fetch 的函数，作为依赖注入给协议层；
+ * - `postJson` / `postSse` 是唯一碰 fetch 的两个函数，作为依赖注入给协议层；
  * - 退出码由 `runRepl` 返回，本文件只负责落实（0 走自然退出，不做 `process.exit`，
  *   这样任何残留句柄都会暴露成「进程不退出」而不是被强行掐掉）。
  */
@@ -12,7 +12,7 @@ import { runRepl, EXIT_FAILURE } from './cli/repl.js';
 import { renderError } from './cli/render.js';
 import { loadConfig, type LogLevel } from './config.js';
 import { createConfigStore, type ConfigStore } from './config-store.js';
-import { postJson } from './http/transport.js';
+import { postJson, postSse } from './http/transport.js';
 import { createLlmClient } from './llm/llm-client.js';
 import { createChatSession } from './session/chat-session.js';
 
@@ -57,6 +57,8 @@ async function main(): Promise<number> {
     // 传读取器：`/config` 改完的值下一回合才生效。
     config: () => store.get(),
     transport: postJson,
+    // 思维链要实时显示，就非得走 SSE；`/think off` 时不传 `onDelta`，自然回到整包请求。
+    streamTransport: postSse,
     // 重试日志属于 info：默认级别下就能在终端看到重试了几次。
     log: (message) => log('info', message),
   });

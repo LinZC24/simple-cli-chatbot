@@ -11,6 +11,11 @@ import {
   ASSISTANT_PREFIX,
   ERROR_PREFIX,
   HISTORY_PREVIEW_LIMIT,
+  NO_REASONING_HINT,
+  THINK_INDENT,
+  THINK_PREFIX,
+  TRUNCATED_HINT,
+  createReplyStream,
   renderBanner,
   renderError,
   renderHelp,
@@ -243,5 +248,101 @@ describe('preview', () => {
 
   it('压掉多余空白', () => {
     expect(preview('  多   空格\n换行  ')).toBe('多 空格 换行');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 流式渲染：`think>` 逐字、切行、收尾
+// ---------------------------------------------------------------------------
+
+describe('createReplyStream', () => {
+  it('第一块思维链带 think> 前缀，续块直接接在后面', () => {
+    const stream = createReplyStream({ color: false });
+
+    expect(stream.push({ kind: 'reasoning', text: '先算 ' })).toBe(`${THINK_PREFIX}先算 `);
+    expect(stream.push({ kind: 'reasoning', text: '两步' })).toBe('两步');
+  });
+
+  it('思维链到正文：先换行，再上 bot> 前缀', () => {
+    const stream = createReplyStream({ color: false });
+    stream.push({ kind: 'reasoning', text: '想好了' });
+
+    expect(stream.push({ kind: 'content', text: '答案是 2' })).toBe(`\n${ASSISTANT_PREFIX}答案是 2`);
+    expect(stream.push({ kind: 'content', text: '。' })).toBe('。');
+  });
+
+  it('没有思维链时正文照常从 bot> 开始（不多一个空行）', () => {
+    const stream = createReplyStream({ color: false });
+
+    expect(stream.push({ kind: 'content', text: '直接回答' })).toBe(`${ASSISTANT_PREFIX}直接回答`);
+  });
+
+  it('上色只在 color 为真时加 dim/reset，且不影响可读内容', () => {
+    const plain = createReplyStream({ color: false });
+    const colored = createReplyStream({ color: true });
+
+    const plainText = plain.push({ kind: 'reasoning', text: '想法' });
+    const coloredText = colored.push({ kind: 'reasoning', text: '想法' });
+
+    expect(plainText).toBe(`${THINK_PREFIX}想法`);
+    expect(coloredText).toContain('\u001b[2m');
+    expect(coloredText).toContain('\u001b[0m');
+    expect(coloredText).toContain(`${THINK_PREFIX}想法`);
+  });
+
+  it('思维链内部自带换行时，续行也补上缩进', () => {
+    const stream = createReplyStream({ color: false });
+
+    expect(stream.push({ kind: 'reasoning', text: '第一段\n第二段' })).toBe(
+      `${THINK_PREFIX}第一段\n${THINK_INDENT}第二段`,
+    );
+  });
+
+  it('续行按前缀宽度对齐（think> 共 7 列）', () => {
+    expect(THINK_INDENT).toHaveLength(THINK_PREFIX.length);
+    expect(THINK_PREFIX).toBe('think> ');
+  });
+
+  it('sawReasoning 记录本回合到底有没有思维链', () => {
+    const without = createReplyStream({ color: false });
+    without.push({ kind: 'content', text: 'x' });
+    expect(without.sawReasoning).toBe(false);
+
+    const withReasoning = createReplyStream({ color: false });
+    withReasoning.push({ kind: 'reasoning', text: 'x' });
+    expect(withReasoning.sawReasoning).toBe(true);
+  });
+
+  it('收尾只补一个换行（正文已经逐字写过了）', () => {
+    const stream = createReplyStream({ color: false });
+    stream.push({ kind: 'content', text: '好的' });
+
+    expect(stream.finish(turn({ content: '好的' }))).toBe('\n');
+  });
+
+  it('只有思维链就被截断：补 bot> 空内容占位与截断提示', () => {
+    const stream = createReplyStream({ color: false });
+    stream.push({ kind: 'reasoning', text: '想了很久……' });
+
+    const text = stream.finish(turn({ content: '', finishReason: 'length' }));
+
+    expect(text).toBe(`\n${ASSISTANT_PREFIX}(模型返回了空内容)\n${TRUNCATED_HINT}\n`);
+  });
+
+  it('一个增量都没收到：把最终内容整行打出来', () => {
+    const stream = createReplyStream({ color: false });
+
+    expect(stream.finish(turn({ content: '迟到的回答' }))).toBe(`${ASSISTANT_PREFIX}迟到的回答\n`);
+  });
+
+  it('正文之后又来思维链（换模型的中间帧）：重开一个 think> 块', () => {
+    const stream = createReplyStream({ color: false });
+    stream.push({ kind: 'content', text: '一半' });
+
+    expect(stream.push({ kind: 'reasoning', text: '再想想' })).toBe(`\n${THINK_PREFIX}再想想`);
+  });
+
+  it('NO_REASONING_HINT 讲清楚怎么关，且只提示一次由调用方控制', () => {
+    expect(NO_REASONING_HINT).toContain('/think off');
   });
 });

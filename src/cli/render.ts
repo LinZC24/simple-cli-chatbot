@@ -26,7 +26,7 @@ import {
   TimeoutError,
   UserAbortError,
 } from '../http/errors.js';
-import type { ChatMessage, Usage } from '../llm/types.js';
+import type { ChatDelta, ChatMessage, Usage } from '../llm/types.js';
 import type { TurnResult } from '../session/chat-session.js';
 
 /** 用户输入提示符（带一个空格）。 */
@@ -44,6 +44,15 @@ export const HISTORY_PREVIEW_LIMIT = 60;
 /** 命中 `max_tokens` 时的提示。 */
 export const TRUNCATED_HINT =
   '  (回答被截断：已达到 max_tokens 上限，可调大 LLM_MAX_TOKENS，或直接说「继续」)';
+/** 模型真的没给正文时的占位（空串是合法回复，不报错，但要有反馈）。 */
+export const EMPTY_REPLY_NOTICE = '(模型返回了空内容)';
+/** 思维链行前缀；缩进宽度与它对齐。 */
+export const THINK_PREFIX = 'think> ';
+/** 思维链续行的缩进（`think> ` 正好 7 个字符）。 */
+export const THINK_INDENT = ' '.repeat(THINK_PREFIX.length);
+/** 模型不返回思维链时的一次性提示。 */
+export const NO_REASONING_HINT =
+  '  (这个模型没有返回思维链，可用 /think off 关掉实时思考显示)';
 
 /** 渲染错误时可以补充的上下文（拿不到就省略，绝不猜测）。 */
 export interface RenderErrorContext {
@@ -62,7 +71,7 @@ export interface RenderedError {
 /** `bot> ...` 一行（必要时追加截断提示）。 */
 export function renderReply(result: TurnResult): string {
   const { assistant } = result;
-  const body = assistant.content === '' ? '(模型返回了空内容)' : assistant.content;
+  const body = assistant.content === '' ? EMPTY_REPLY_NOTICE : assistant.content;
   const lines = [`${ASSISTANT_PREFIX}${body}`];
 
   // `finish_reason === 'length'` 不是错误，只提示「话说完了但被截断」。
@@ -71,6 +80,81 @@ export function renderReply(result: TurnResult): string {
   }
 
   return lines.join('\n');
+}
+
+/** 上色用的 ANSI 序列。只在真终端里用：重定向到文件时它们就是噪音。 */
+const DIM = '\u001b[2m';
+const RESET = '\u001b[0m';
+
+export interface ReplyStreamOptions {
+  /** 是否给思维链加暗淡色（等价于「输出是不是终端」）。 */
+  readonly color: boolean;
+}
+
+/**
+ * 流式渲染器：把 `ChatDelta` 增量变成「可以直接写到输出流的文本」。
+ *
+ * 不自己写 I/O（返回字符串，由 CLI 层落盘），所以能当纯函数测。
+ * 状态机只三态：还没开始 / 正在思维链 / 正在正文 —— 正文一旦开始又收到思维链
+ * （换模型的中间帧），重开一个 `think>` 块而不报错。
+ */
+export interface ReplyStream {
+  /** 一个增量 → 要写出去的文本（可能是空串，调用方不必判断空）。 */
+  push(delta: ChatDelta): string;
+  /** 回合收尾 → 关行、补空回复占位与截断提示。**总是以 `\n` 结尾**。 */
+  finish(result: TurnResult): string;
+  /** 这个回合到底有没有思维链（用来决定要不要提示一次）。 */
+  readonly sawReasoning: boolean;
+}
+
+export function createReplyStream(options: ReplyStreamOptions): ReplyStream {
+  const dim = (text: string): string => (options.color && text !== '' ? `${DIM}${text}${RESET}` : text);
+  let phase: 'idle' | 'thinking' | 'content' = 'idle';
+  let sawReasoning = false;
+  let emittedContent = false;
+
+  return {
+    push(delta) {
+      if (delta.kind === 'reasoning') {
+        sawReasoning = true;
+        const restart = phase === 'content' ? '\n' : '';
+        const text = phase === 'thinking' ? delta.text : `${THINK_PREFIX}${delta.text}`;
+        phase = 'thinking';
+        // 思维链自己带换行时也要续上缩进，否则第二个段落会跑到屏幕最左边。
+        return `${restart}${dim(text.replaceAll('\n', `\n${THINK_INDENT}`))}`;
+      }
+
+      emittedContent = true;
+      if (phase === 'content') {
+        return delta.text;
+      }
+      // 从思维链（或开局）切到正文：先把上一行关掉，再上 `bot> ` 前缀。
+      const lead = phase === 'thinking' ? '\n' : '';
+      phase = 'content';
+      return `${lead}${ASSISTANT_PREFIX}${delta.text}`;
+    },
+
+    finish(result) {
+      const lines: string[] = [];
+
+      if (!emittedContent) {
+        // 思维链没有接入正文（被 max_tokens 截在思考阶段）：也要给一行表态。
+        if (phase === 'thinking') {
+          lines.push('');
+        }
+        lines.push(`${ASSISTANT_PREFIX}${result.assistant.content === '' ? EMPTY_REPLY_NOTICE : result.assistant.content}`);
+      } else {
+        lines.push('');
+      }
+
+      const text = `${lines.join('\n')}\n`;
+      return result.assistant.finishReason === 'length' ? `${text}${TRUNCATED_HINT}\n` : text;
+    },
+
+    get sawReasoning() {
+      return sawReasoning;
+    },
+  };
 }
 
 /** 把任意异常渲染成一行（最多两行）stderr 文本。 */
@@ -156,6 +240,7 @@ export function renderHelp(): string {
     '  /config set <键> <值>  直接改一项（值写 - 则恢复默认）',
     '  /config reset    恢复启动时的配置（本次会话内）',
     '  /config save     把改动写回 .env（自动备份 .env.bak）',
+    '  /think on|off    开关思维链实时显示（默认开；不带参数看当前状态）',
     '  /help            显示这份帮助',
     '其他输入都当作对话内容；空行忽略；Ctrl-C 取消当前回合。',
   ].join('\n');
@@ -192,6 +277,18 @@ export function renderSystemUsage(): string {
 /** 未知斜杠命令的提示。 */
 export function renderUnknownCommand(name: string): string {
   return `未知命令：${name}。输入 /help 查看可用命令。`;
+}
+
+/** `/think` 开关的回执：直接说清楚现在是哪一边。 */
+export function renderThinkToggle(enabled: boolean): string {
+  return enabled
+    ? '思维链显示：开（回答会逐字显示，思考过程带 think> 前缀）'
+    : '思维链显示：关（改为整包请求，回答一次给出）；需重新开启请输入 /think on';
+}
+
+/** `/think` 收到无法识别的参数时。 */
+export function renderThinkUsage(): string {
+  return '用法：/think on | /think off（不带参数则打印当前状态）。';
 }
 
 /** debug 级别的 usage 行。 */

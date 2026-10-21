@@ -12,11 +12,16 @@ cli-chatbot · model=gpt-4o-mini · base=https://api.openai.com/v1
 历史上限 40 条 · 超时 30000 ms · 最大重试 3 次
 输入 /help 查看命令，Ctrl-D 或 /exit 退出。
 
-you> 记住数字 42
-bot> 好，记住了。
+you> 9.11 和 9.9 哪个大？
+think> 先比整数部分，都是 9……
+       再看小数位：11 vs 9，所以 0.11 > 0.9
+bot> 9.9 更大。
 you> 我刚让你记的数字加 8 是多少？
 bot> 50。
 ```
+
+思维链是流式的：`think>` 那几行随模型吐字逐行出现（终端里是暗色），正文紧跟着 `bot>` 逐字出来。
+不想要就 `/think off`，退回整包请求、一次给出回答。
 
 ## 快速开始
 
@@ -42,6 +47,7 @@ pnpm dev                  # 等同 pnpm start
 | `/config set <键> <值>` | 一行直达；值写 `-` 恢复默认 |
 | `/config reset` | 恢复启动时的配置（本次会话内） |
 | `/config save` | 把改动写回 `.env`（原文件备份为 `.env.bak`） |
+| `/think on`、`/think off` | 开关思维链实时显示（默认开）；不带参数打印当前状态 |
 | `/help` | 命令列表 |
 | 空行 | 忽略 |
 | 退格 / 方向键 / ↑ / Ctrl-C | 交互模式的编辑键由 readline 处理；↑ 翻回上一句，Tab 补全已关掉 |
@@ -63,6 +69,28 @@ pnpm dev                  # 等同 pnpm start
 它们在进程启动时就被交给传输层了，运行时改只会让人以为改了。它们在表格里显示成一行只读汇总，
 `apiKey` 连片段都不露（只显示“已设置 / 未设置”）。
 
+## 思维链
+
+请求带 `stream: true`，把 SSE 的 `delta` 分成两类上报：`reasoning_content`（思维链）
+与 `content`（回答）。渲染层据此写两种行：
+
+```text
+think> 先比整数部分，都是 9……
+       再看小数位：11 vs 9，所以 0.11 > 0.9
+bot> 9.9 更大。
+```
+
+- 思维链行是暗色的（`\u001b[2m`），**只在真终端里上色**——重定向到文件时 ANSI 序列只会是噪音。
+- 续行按 `think> `（7 列）缩进，换行之后仍然看得出哪几行是思考。
+- 模型从思考切到回答时自动换行加 `bot> `，正文逐字流出来，不用等整段生成完。
+- `/think off` 之后不再传 `onDelta`，客户端自动退回整包 JSON 请求，回答一次给出。
+- 模型不返回思维链时（普通模型、或服务端不带 `reasoning_content`），终端里只提示一次，
+  免得每回合都刷一行；管道/重定向下不提示。
+- 支持两种字段名：DeepSeek 的 `reasoning_content`、以及部分服务的 `reasoning`。
+
+思维链**不进历史**：`AssistantMessage.reasoning` 只给渲染层看，写进 `messages` 的永远只有 `content`。
+理由很实际——推理过程对下一轮没有价值，却会成倍放大 token 账单与上下文长度。
+
 ## 分层
 
 | 位置 | 职责 | 不许做 |
@@ -72,8 +100,9 @@ pnpm dev                  # 等同 pnpm start
 | `src/env-file.ts:1` | 把改动写回 `.env`（纯函数合并 + 备份） | 决定该写哪些键 |
 | `src/http/errors.ts:1` | 错误分类（可重试 / 不可重试） | 造文案、打日志 |
 | `src/http/retry.ts:1` | 纯函数 `decide(error, attemptsMade, opts)` | 真的 sleep |
-| `src/http/transport.ts:1` | 唯一调 `fetch` 的地方：超时、重试循环、状态码映射 | 知道 LLM 协议的形状 |
-| `src/llm/llm-client.ts:1` | 唯一知道 `choices[0].message.content` 的地方：拼请求、校验响应 | 重试、管历史、打印 |
+| `src/http/transport.ts:1` | 唯一调 `fetch` 的地方：整包 `postJson`、流式 `postSse`、超时（流式是空闲超时）、重试循环 | 知道 LLM 协议的形状 |
+| `src/llm/sse.ts:1` | 纯函数式 SSE 解析：`data:` 成帧、`[DONE]` 哨兵、跨块拼接 | 碰网络、判断协议字段 |
+| `src/llm/llm-client.ts:1` | 唯一知道 `choices[0].message.content` 的地方：拼请求、校验响应、聚合流 | 重试、管历史、打印 |
 | `src/session/chat-session.ts:1` | 唯一改 `messages` 的地方：回合事务、裁剪历史 | 碰网络、碰终端 |
 | `src/cli/render.ts:1` | 纯函数出文案：前缀、错误文案、截断提示 | 判断错误该怎么处理 |
 | `src/cli/repl.ts:1` | 读行、解析斜杠命令、菜单状态机、信号与退出码 | 组装请求、解析响应 |
@@ -103,14 +132,14 @@ pnpm dev                  # 等同 pnpm start
 
 ```bash
 pnpm typecheck                        # exit 0
-pnpm test                             # 12 个文件 340 条
+pnpm test                             # 14 个文件 401 条
 pnpm test:watch
 grep -rn ': any\b' src/               # 无输出
 grep -rn ' as [A-Z]' src/             # 只有 src/http/transport.ts:210 的 JSON.parse 边界
 ```
 
-测试分三层：L1 纯函数（`retry` / `render` / `session` 的裁剪逻辑）、L2 `vi.stubGlobal('fetch')`
-打桩（状态码映射、重试次数、超时）、L3 真 socket（`node:http` 在 `listen(0)` 随机端口起假服务器，
+测试分三层：L1 纯函数（`retry` / `render` / `sse` / `session` 的裁剪逻辑）、L2 `vi.stubGlobal('fetch')`
+打桩（状态码映射、重试次数、超时、流式逐块产出与中途断流）、L3 真 socket（`node:http` 在 `listen(0)` 随机端口起假服务器，
 覆盖 hang→超时、连接被掐断、真 SIGINT 进程退出码）。`scripts/record-demo.mjs` 也是 L3 的一种。
 
 ## 验收对照
@@ -133,8 +162,9 @@ asciinema play demo.cast      # 需要 asciinema，本机没装也没关系—�
 node scripts/record-demo.mjs  # 重新生成（会覆盖）
 ```
 
-录像里有两幕：第一幕三轮对话，第一轮先吃一个 `429`（`Retry-After: 1`）再成功；
-第二幕服务器不响应，请求在飞时按 Ctrl-C，退出码 `130`、耗时约 300ms。
+录像里有两幕：第一幕三轮对话，第一轮先吃一个 `429`（`Retry-After: 1`）再成功，
+每轮的 `think>` 与 `bot>` 都是服务端逐块吐出来的（假服务器走 SSE）；第二幕服务器不响应，
+请求在飞时按 Ctrl-C，退出码 `130`、耗时约 300ms。
 
 因为这台机器没有 `asciinema`，`scripts/record-demo.mjs` 是**真的把 CLI 跑起来**、
 按真实时间戳收 stdout/stderr，再写成 asciinema v2 格式——内容是程序自己产的，
@@ -194,6 +224,19 @@ node scripts/record-demo.mjs  # 重新生成（会覆盖）
     取值提示（`/config` 里等新值那一行）同样如此。顺带白拿两个交互细节：`historySize` 让 ↑ 能翻回上一句，
     `completer` 返回空数组把 Tab 补全关掉——聊天框里蹦出一串 JS 标识符候选纯属碍事。
 
+12. **流式一旦开始就不能重试，断流只能报错。** 重试的语义是「这次请求白做了，再来一次」，
+    可已经打到屏幕上的字收不回来——重放会把同样的内容再输出一遍。所以 `postSse` 的重试只覆盖到
+    「拿到响应头」为止（429 / 5xx / 连不上照旧重试），正文一旦开始，中途断流就抛 `NetworkError`。
+    同理，`timeoutMs` 在流式下变成**空闲超时**（两块数据之间允许的最长间隔），而不是整个响应体的总时长，
+    否则一次长回答必然被自己的超时掐掉。
+
+13. **`stream: true` 之后要假设对面可能不听话。** 三种现实情况都得兜住：① 服务端（或中间的代理）
+    无视 `stream: true` 直接回整包 JSON —— 按 `content-type` 认出来，包成一帧 SSE 喂给同一个解析器，
+    上层不必为「到底有没有流」分叉；`content-type` 缺失时仍按 SSE 处理（请求里已经明确要了流）。
+    ② 收尾靠 `data: [DONE]` 哨兵，不能指望服务端一定关连接。③ 思维链字段名不统一
+    （`reasoning_content` / `reasoning`），`null` 当没给、非字符串则报形状错误——静默忽略只会让
+    「回答被吞了」变成查不出来的 bug。
+
 ## 目录
 
 ```text
@@ -207,14 +250,15 @@ src/
     retry.ts              重试决策（纯函数）
     transport.ts          唯一调 fetch 的地方
   llm/
-    types.ts              消息 / 请求 / 响应类型
-    llm-client.ts         拼请求、校验响应
+    types.ts              消息 / 请求 / 响应 / 增量类型
+    sse.ts                SSE 解析（纯函数）
+    llm-client.ts         拼请求、校验响应、聚合流
   session/
     chat-session.ts       历史、事务提交、裁剪
   cli/
     render.ts             文案
     repl.ts               readline、斜杠命令、信号
-test/                     L1 + L2 + L3，340 条
+test/                     L1 + L2 + L3，401 条
 scripts/record-demo.mjs   生成 demo.cast
 ```
 

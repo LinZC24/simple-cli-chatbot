@@ -19,7 +19,19 @@ export type FlakyStep =
   /** 故意不响应，`ms` 之后才 end —— 用来触发超时。 */
   | { readonly kind: 'hang'; readonly ms: number }
   /** 直接断连 —— 触发 NetworkError。 */
-  | { readonly kind: 'destroy' };
+  | { readonly kind: 'destroy' }
+  /**
+   * 200 + `text/event-stream`，按 `chunks` 依次写出（每块之间 `gapMs`）。
+   * `raw: true` 时字符串原样发送，不补 `data: ` 前缀与空行 —— 用来测「服务端把事件拆成多块」。
+   */
+  | {
+      readonly kind: 'sse';
+      readonly chunks: readonly string[];
+      readonly gapMs?: number;
+      readonly raw?: boolean;
+    }
+  /** 发完 `chunks` 就直接断连 —— 模拟中途断流。 */
+  | { readonly kind: 'sse-destroy'; readonly chunks: readonly string[] };
 
 export interface FlakyServer {
   readonly url: string;
@@ -72,6 +84,47 @@ export async function startFlakyServer(steps: readonly FlakyStep[]): Promise<Fla
         res.destroy();
         req.socket.destroy();
         break;
+      case 'sse': {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        const gapMs = step.gapMs ?? 0;
+        let index = 0;
+        const writeNext = (): void => {
+          const chunk = step.chunks[index];
+          if (chunk === undefined) {
+            res.end();
+            return;
+          }
+          index += 1;
+          res.write(step.raw === true ? chunk : `data: ${chunk}\n\n`);
+          if (gapMs > 0) {
+            const timer = setTimeout(() => {
+              timers.delete(timer);
+              writeNext();
+            }, gapMs);
+            timers.add(timer);
+            timer.unref();
+            return;
+          }
+          writeNext();
+        };
+        writeNext();
+        break;
+      }
+      case 'sse-destroy': {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        for (const chunk of step.chunks) {
+          res.write(`data: ${chunk}\n\n`);
+        }
+        // 先让已写的数据真的发出去（立刻 destroy 的 RST 会把它们丢掉），再硬断。
+        const timer = setTimeout(() => {
+          timers.delete(timer);
+          res.destroy();
+          req.socket.destroy();
+        }, 20);
+        timers.add(timer);
+        timer.unref();
+        break;
+      }
     }
   });
 
