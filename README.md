@@ -1,6 +1,7 @@
 # cli-chatbot
 
-一个跑在终端里的多轮对话机器人。除了 `node` 内置模块，运行时**零依赖**（`dependencies` 是空对象），
+一个跑在终端里的多轮对话机器人。运行时依赖只有两个——`marked`（markdown 解析）与
+`highlight.js`（代码高亮），两者的传递依赖都是 0；其余全用 `node` 内置模块。
 用 TypeScript 写、`tsx` 直接跑、`vitest` 测。
 
 它想证明的不是「能调通 API」，而是**一个 LLM CLI 该有的骨架**：分层清晰、错误分得清、
@@ -48,6 +49,7 @@ pnpm dev                  # 等同 pnpm start
 | `/config reset` | 恢复启动时的配置（本次会话内） |
 | `/config save` | 把改动写回 `.env`（原文件备份为 `.env.bak`） |
 | `/think on`、`/think off` | 开关思维链实时显示（默认开）；不带参数打印当前状态 |
+| `/md on`、`/md off` | 开关 markdown 渲染（终端里默认开、管道里默认关）；不带参数打印当前状态 |
 | `/help` | 命令列表 |
 | 空行 | 忽略 |
 | 退格 / 方向键 / ↑ / Ctrl-C | 交互模式的编辑键由 readline 处理；↑ 翻回上一句，Tab 补全已关掉 |
@@ -91,6 +93,31 @@ bot> 9.9 更大。
 思维链**不进历史**：`AssistantMessage.reasoning` 只给渲染层看，写进 `messages` 的永远只有 `content`。
 理由很实际——推理过程对下一轮没有价值，却会成倍放大 token 账单与上下文长度。
 
+## markdown 渲染
+
+模型吐的正文默认按 markdown 渲染（真终端里才开，管道/重定向默认关，`/md on|off` 可改）：
+
+```text
+bot> 结论
+     • 行内标记等整行
+     • 表格等整张
+     ┌─ ts
+     │ const a = 1;
+     └─
+     ┌──────┬────┐
+     │ 名称 │ 值 │
+     ├──────┼────┤
+     │ 甲   │  1 │
+     └──────┴────┘
+```
+
+- 解析交给 `marked`（`Lexer.lex`），渲染自己写：标题/粗体/斜体/删除线/行内代码/列表/引用/分隔线/
+  链接/代码块 + 语法高亮/表格（方框 + 左右居中对齐，CJK 按两列算宽度）。
+- **流式是逐行渲染的**：一行攒齐才上色，所以不会看到半截 `**粗`；代码块体内逐行就吐（否则就不「流」了）；
+  表格必须等整张表结束（列宽是所有行算出来的）；`finish()` 兜住残行、残表、没闭合的代码块。
+- 思维链（`think>`）**不渲染**：那是模型的草稿，里面常有半截标记，原样流式更好读。
+- 宽度取终端列数，太窄时抬到 20 列；纯文本模式不画方框、只缩进（`> chat.log` 之后还能 diff）。
+
 ## 分层
 
 | 位置 | 职责 | 不许做 |
@@ -102,6 +129,10 @@ bot> 9.9 更大。
 | `src/http/retry.ts:1` | 纯函数 `decide(error, attemptsMade, opts)` | 真的 sleep |
 | `src/http/transport.ts:1` | 唯一调 `fetch` 的地方：整包 `postJson`、流式 `postSse`、超时（流式是空闲超时）、重试循环 | 知道 LLM 协议的形状 |
 | `src/llm/sse.ts:1` | 纯函数式 SSE 解析：`data:` 成帧、`[DONE]` 哨兵、跨块拼接 | 碰网络、判断协议字段 |
+| `src/markdown/ansi.ts:1` | ANSI 上色与显示宽度（CJK/emoji 算两列）、按宽度截断与补齐 | 知道 markdown 语法 |
+| `src/markdown/highlight.ts:1` | `highlight.js` 的 HTML → ANSI（span 栈 + 实体解码） | 排版、缩进 |
+| `src/markdown/render.ts:1` | markdown → 终端文本：块级、行内、表格、代码块方框 | 读写流、碰终端 |
+| `src/markdown/stream.ts:1` | 按行缓冲的流式渲染：围栏状态机、表格攒块 | 决定某个 token 怎么排版 |
 | `src/llm/llm-client.ts:1` | 唯一知道 `choices[0].message.content` 的地方：拼请求、校验响应、聚合流 | 重试、管历史、打印 |
 | `src/session/chat-session.ts:1` | 唯一改 `messages` 的地方：回合事务、裁剪历史 | 碰网络、碰终端 |
 | `src/cli/render.ts:1` | 纯函数出文案：前缀、错误文案、截断提示 | 判断错误该怎么处理 |
@@ -132,10 +163,10 @@ bot> 9.9 更大。
 
 ```bash
 pnpm typecheck                        # exit 0
-pnpm test                             # 14 个文件 401 条
+pnpm test                             # 18 个文件 537 条
 pnpm test:watch
 grep -rn ': any\b' src/               # 无输出
-grep -rn ' as [A-Z]' src/             # 只有 src/http/transport.ts:210 的 JSON.parse 边界
+grep -rn ' as [A-Z]' src/             # 只有 src/http/transport.ts:222 的 JSON.parse 边界
 ```
 
 测试分三层：L1 纯函数（`retry` / `render` / `sse` / `session` 的裁剪逻辑）、L2 `vi.stubGlobal('fetch')`
@@ -237,6 +268,23 @@ node scripts/record-demo.mjs  # 重新生成（会覆盖）
     （`reasoning_content` / `reasoning`），`null` 当没给、非字符串则报形状错误——静默忽略只会让
     「回答被吞了」变成查不出来的 bug。
 
+14. **`marked` 的 `Token` 是联合类型，但 `switch (token.type)` 收不窄。**
+    因为 `Token = MarkedToken | Tokens.Generic`，而 `Generic` 带 `[index: string]: any` 索引签名，
+    `case 'heading'` 分支里的 `token.depth` 依然是 `unknown` 级别。项目没注册任何扩展，
+    `Generic` 永远不会出现，所以先过一道白名单 `isMarkedToken()` 把类型收窄——比在 22 处塞
+    `as Tokens.Heading` 诚实得多，而且只需要 1 个判断。
+
+15. **`highlight.js` 的子路径没有类型声明。** `highlight.js/lib/languages/typescript` 之类的导入
+    在 `strict` 下直接 TS7016（只有主包和 `lib/common` 有 types 条件）。所以用
+    `import hljs from 'highlight.js/lib/common'`：37 种常用语言一次带上，代价是体积而不是可维护性。
+    它吐的是 HTML（`<span class="hljs-keyword">`），还得过一道 30 行的扫描器：维护一个 **span 栈**
+    （`hljs-string` 里套 `hljs-subst`，内层关闭必须把外层重新打开，否则后面几个字符就掉色）
+    并解码 `&quot;` `&#x27;` 这类实体——颜色错了只是难看，标签或实体漏到屏幕上就是事故。
+
+16. **任务列表的 `[x]` 已经被 `marked` 摘走了。** `list_item.task/text` 里只剩正文（`done`），
+    勾选状态在 `item.checked`，而 `item.tokens` 里多了一个 `checkbox` token（它的 `raw` 就是 `[x]`）。
+    最初按「正文开头是 `[x] `」去识别，结果正文里本没有它，于是复选框丢了、还凭空多出一行 `[x]`。
+
 ## 目录
 
 ```text
@@ -253,14 +301,24 @@ src/
     types.ts              消息 / 请求 / 响应 / 增量类型
     sse.ts                SSE 解析（纯函数）
     llm-client.ts         拼请求、校验响应、聚合流
+  markdown/
+    ansi.ts               ANSI + 显示宽度（CJK 两列）
+    highlight.ts          highlight.js 的 HTML → ANSI
+    render.ts             markdown → 终端文本
+    stream.ts             按行缓冲的流式渲染
   session/
     chat-session.ts       历史、事务提交、裁剪
   cli/
     render.ts             文案
     repl.ts               readline、斜杠命令、信号
-test/                     L1 + L2 + L3，401 条
+test/                     L1 + L2 + L3，537 条
 scripts/record-demo.mjs   生成 demo.cast
 ```
 
-零依赖的一个副作用是：`tsconfig.json` 里的 `strict`、`noUncheckedIndexedAccess`、`exactOptionalPropertyTypes`、
-`verbatimModuleSyntax` 全开着，也没有 `any` 可以退回去——所有边界都得写成显式的类型守卫。
+引入 `marked` 与 `highlight.js` 这两个依赖的代价，是 `dependencies` 不再为空 —— 换来的是
+「不自己写 markdown 解析器」：`marked` 的传递依赖是 0，`highlight.js` 也是 0，两者加起来仍然
+没有「依赖树」。真正的零依赖替代品（`markdansi` 等）要么 `engines` 要求 node>=22，要么周下载量两位数，
+要么 GPL —— 自己写解析器的风险比多两个包大得多。
+
+严格模式全开着（`strict`、`noUncheckedIndexedAccess`、`exactOptionalPropertyTypes`、
+`verbatimModuleSyntax`），也没有 `any` 可以退回去 —— 所有边界都得写成显式的类型守卫。

@@ -27,6 +27,9 @@ import {
   UserAbortError,
 } from '../http/errors.js';
 import type { ChatDelta, ChatMessage, Usage } from '../llm/types.js';
+import type { MarkdownOptions } from '../markdown/render.js';
+import { renderMarkdown } from '../markdown/render.js';
+import type { MarkdownStream } from '../markdown/stream.js';
 import type { TurnResult } from '../session/chat-session.js';
 
 /** 用户输入提示符（带一个空格）。 */
@@ -69,9 +72,16 @@ export interface RenderedError {
 }
 
 /** `bot> ...` 一行（必要时追加截断提示）。 */
-export function renderReply(result: TurnResult): string {
+export interface RenderReplyOptions {
+  /** 有值时把正文当 markdown 渲染（非流式回合：`/think off`）。 */
+  readonly markdown?: MarkdownOptions | undefined;
+}
+
+export function renderReply(result: TurnResult, options: RenderReplyOptions = {}): string {
   const { assistant } = result;
-  const body = assistant.content === '' ? EMPTY_REPLY_NOTICE : assistant.content;
+  const rendered =
+    options.markdown === undefined ? assistant.content : renderMarkdown(assistant.content, options.markdown);
+  const body = rendered === '' ? EMPTY_REPLY_NOTICE : rendered;
   const lines = [`${ASSISTANT_PREFIX}${body}`];
 
   // `finish_reason === 'length'` 不是错误，只提示「话说完了但被截断」。
@@ -89,6 +99,14 @@ const RESET = '\u001b[0m';
 export interface ReplyStreamOptions {
   /** 是否给思维链加暗淡色（等价于「输出是不是终端」）。 */
   readonly color: boolean;
+  /**
+   * 正文的 markdown 渲染器。
+   *
+   * `undefined` 表示按原文输出：管道/重定向（没有终端宽度也没人看颜色）、
+   * 或用户敲了 `/md off`。思维链不经过这里 —— 它带的是模型内部的草稿，
+   * 里面常有半截 markdown，渲染反而看不得。
+   */
+  readonly markdown?: MarkdownStream | undefined;
 }
 
 /**
@@ -109,6 +127,9 @@ export interface ReplyStream {
 
 export function createReplyStream(options: ReplyStreamOptions): ReplyStream {
   const dim = (text: string): string => (options.color && text !== '' ? `${DIM}${text}${RESET}` : text);
+  const markdown = options.markdown;
+  /** 正文增量交给 markdown 渲染器；没开渲染时原样放行。 */
+  const forward = (text: string): string => (markdown === undefined ? text : markdown.push(text));
   let phase: 'idle' | 'thinking' | 'content' = 'idle';
   let sawReasoning = false;
   let emittedContent = false;
@@ -126,28 +147,45 @@ export function createReplyStream(options: ReplyStreamOptions): ReplyStream {
 
       emittedContent = true;
       if (phase === 'content') {
-        return delta.text;
+        return forward(delta.text);
       }
       // 从思维链（或开局）切到正文：先把上一行关掉，再上 `bot> ` 前缀。
       const lead = phase === 'thinking' ? '\n' : '';
       phase = 'content';
-      return `${lead}${ASSISTANT_PREFIX}${delta.text}`;
+      return `${lead}${ASSISTANT_PREFIX}${forward(delta.text)}`;
     },
 
     finish(result) {
       const lines: string[] = [];
+      const body = result.assistant.content === '' ? EMPTY_REPLY_NOTICE : result.assistant.content;
+
+      let tail = '';
+      if (markdown !== undefined) {
+        // 一个正文增量都没收到（模型整包返回、或没有流式通道）：把最终正文补喂给渲染器，
+        // 让「该不该画方框/表格」跟真流式走同一条路径，而不是退化成原文。
+        // 注意 `push()` 是**返回**要写的文本，不是自己写出去 —— 忘了接返回值就是白吞。
+        const prefilled = emittedContent ? '' : markdown.push(`${body}\n`);
+        // 行缓冲里可能还攒着半行/半张表/没闭合的代码块，收尾时一次性吐出。
+        tail = `${prefilled}${markdown.finish()}`.replace(/\n+$/, '');
+      }
 
       if (!emittedContent) {
         // 思维链没有接入正文（被 max_tokens 截在思考阶段）：也要给一行表态。
         if (phase === 'thinking') {
           lines.push('');
         }
-        lines.push(`${ASSISTANT_PREFIX}${result.assistant.content === '' ? EMPTY_REPLY_NOTICE : result.assistant.content}`);
-      } else {
+        let rendered = body;
+        if (markdown !== undefined) {
+          rendered = tail === '' ? EMPTY_REPLY_NOTICE : tail;
+        }
+        lines.push(`${ASSISTANT_PREFIX}${rendered}`);
+      } else if (markdown === undefined) {
         lines.push('');
+      } else if (tail !== '') {
+        lines.push(tail);
       }
 
-      const text = `${lines.join('\n')}\n`;
+      const text = lines.length === 0 ? '\n' : `${lines.join('\n')}\n`;
       return result.assistant.finishReason === 'length' ? `${text}${TRUNCATED_HINT}\n` : text;
     },
 
@@ -241,6 +279,7 @@ export function renderHelp(): string {
     '  /config reset    恢复启动时的配置（本次会话内）',
     '  /config save     把改动写回 .env（自动备份 .env.bak）',
     '  /think on|off    开关思维链实时显示（默认开；不带参数看当前状态）',
+    '  /md on|off       开关 markdown 渲染（默认终端里开、管道里关）',
     '  /help            显示这份帮助',
     '其他输入都当作对话内容；空行忽略；Ctrl-C 取消当前回合。',
   ].join('\n');
@@ -289,6 +328,18 @@ export function renderThinkToggle(enabled: boolean): string {
 /** `/think` 收到无法识别的参数时。 */
 export function renderThinkUsage(): string {
   return '用法：/think on | /think off（不带参数则打印当前状态）。';
+}
+
+/** `/md` 收到无法识别的参数时。 */
+export function renderMarkdownUsage(): string {
+  return '用法：/md on | /md off（不带参数则打印当前状态）。';
+}
+
+/** `/md` 的开关回显。 */
+export function renderMarkdownToggle(enabled: boolean): string {
+  return enabled
+    ? 'markdown 渲染：开（标题/粗体/列表/表格/代码块按格式显示）'
+    : 'markdown 渲染：关（原样输出模型给的文本）；重新开启请输入 /md on';
 }
 
 /** debug 级别的 usage 行。 */

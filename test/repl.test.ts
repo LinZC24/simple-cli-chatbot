@@ -21,6 +21,7 @@ import {
   type ShutdownDeps,
 } from '../src/cli/repl.js';
 import { loadConfig } from '../src/config.js';
+import { stripAnsi } from '../src/markdown/ansi.js';
 import { createConfigStore, type ConfigStore } from '../src/config-store.js';
 import type { EnvFileResult } from '../src/env-file.js';
 import { AuthError, UserAbortError } from '../src/http/errors.js';
@@ -769,5 +770,83 @@ describe('/think', () => {
     expect(result.stdout).toContain('think> 想到一半');
     expect(result.stderr).toContain('鉴权失败');
     expect(result.code).toBe(EXIT_OK);
+  });
+});
+
+describe('parseInput：/md', () => {
+  it.each([
+    ['/md', { kind: 'markdown', mode: 'status' }],
+    ['/md on', { kind: 'markdown', mode: 'on' }],
+    ['/md OFF', { kind: 'markdown', mode: 'off' }],
+    ['/md 也许', { kind: 'markdown', mode: 'unknown' }],
+  ])('%s', (line, expected) => {
+    expect(parseInput(line)).toEqual(expected);
+  });
+
+  it('/md 与 /think 互不干扰', () => {
+    expect(parseInput('/think off')).toEqual({ kind: 'think', mode: 'off' });
+  });
+});
+
+describe('/md 开关', () => {
+
+  it('管道（非终端）默认不渲染：`##` 原样留着', async () => {
+    const result = await run(['## 标题'], { session: makeSession(async () => ({ ...REPLY, content: '## 标题' })).session });
+    expect(result.stdout).toContain('## 标题');
+  });
+
+  it('/md on 之后按格式渲染', async () => {
+    const result = await run(['/md on', '## 标题'], {
+      session: makeSession(async () => ({ ...REPLY, content: '## 标题' })).session,
+    });
+    expect(result.stdout).toContain('markdown 渲染：开');
+    expect(result.stdout).toContain('bot> 标题');
+    // 输入回显里当然还有 `##`，被渲染掉的应该只是输出那行。
+    expect(result.stdout).not.toContain('bot> ## 标题');
+  });
+
+  it('终端里默认开，/md off 之后恢复原样', async () => {
+    const session = makeSession(async () => ({ ...REPLY, content: '**粗**' })).session;
+    const on = await run(['**粗**'], { session: makeSession(async () => ({ ...REPLY, content: '**粗**' })).session, tty: true });
+    expect(stripAnsi(on.stdout)).toContain('bot> 粗');
+
+    const off = await run(['/md off', '**粗**'], { session, tty: true });
+    expect(off.stdout).toContain('markdown 渲染：关');
+    expect(off.stdout).toContain('**粗**');
+  });
+
+  it('不带参数只打印当前状态', async () => {
+    const result = await run(['/md']);
+    expect(result.stdout).toContain('markdown 渲染：');
+  });
+
+  it('参数不认识时给用法，不当作正文发给模型', async () => {
+    const harness = makeSession();
+    const result = await run(['/md 也许'], { session: harness.session });
+    expect(result.stdout).toContain('用法');
+    expect(harness.requests).toHaveLength(0);
+  });
+
+  it('markdown 表格在终端里被画成方框', async () => {
+    const table = ['| a | b |', '| - | - |', '| 1 | 2 |'].join('\n');
+    const result = await run([table], {
+      session: makeSession(async () => ({ ...REPLY, content: table })).session,
+      tty: true,
+    });
+    expect(stripAnsi(result.stdout)).toContain('┌───┬───┐');
+  });
+
+  it('多行 markdown 在流式下也不丢行（正文按行渲染）', async () => {
+    // 增量按行切（真实 SSE 也常这样），确认逐行渲染不丢行。
+    const harness = makeStreamSession([
+      { kind: 'content', text: '## 标题\n' },
+      { kind: 'content', text: '\n第一段\n' },
+      { kind: 'content', text: '\n- a\n- b' },
+    ]);
+    const result = await run(['讲一下'], { session: harness.session, tty: true });
+    const text = stripAnsi(result.stdout);
+    expect(text).toContain('标题');
+    expect(text).toContain('• a');
+    expect(text).toContain('• b');
   });
 });

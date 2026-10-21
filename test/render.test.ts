@@ -20,6 +20,8 @@ import {
   renderError,
   renderHelp,
   renderHistory,
+  renderMarkdownToggle,
+  renderMarkdownUsage,
   renderReply,
   renderResetDone,
   renderSystemUpdated,
@@ -29,6 +31,8 @@ import {
   preview,
 } from '../src/cli/render.js';
 import { loadConfig } from '../src/config.js';
+import { createMarkdownOptions } from '../src/markdown/render.js';
+import { createMarkdownStream } from '../src/markdown/stream.js';
 import {
   AuthError,
   BadRequestError,
@@ -344,5 +348,46 @@ describe('createReplyStream', () => {
 
   it('NO_REASONING_HINT 讲清楚怎么关，且只提示一次由调用方控制', () => {
     expect(NO_REASONING_HINT).toContain('/think off');
+  });
+});
+
+describe('markdown 接线', () => {
+  const markdown = createMarkdownOptions({ width: 40 });
+
+  it('renderReply 传了 markdown 选项就按格式渲染', () => {
+    const text = renderReply(turn({ content: '## 标题\n\n- a\n- b' }), { markdown });
+    expect(text).toBe(`${ASSISTANT_PREFIX}标题\n• a\n• b`);
+  });
+
+  it('不传选项时保持原样（管道/重定向的行为不变）', () => {
+    expect(renderReply(turn({ content: '## 标题' }))).toBe(`${ASSISTANT_PREFIX}## 标题`);
+  });
+
+  it('渲染结果是空串时仍给占位', () => {
+    expect(renderReply(turn({ content: '   ' }), { markdown })).toBe(`${ASSISTANT_PREFIX}(模型返回了空内容)`);
+  });
+
+  it('流式正文经 markdown 渲染器逐行吐出', () => {
+    const stream = createReplyStream({ color: false, markdown: createMarkdownStream(markdown) });
+    expect(stream.push({ kind: 'content', text: '## 标' })).toBe(`${ASSISTANT_PREFIX}`);
+    // 源文本里那个空行照样输出（流式不会替用户删空行）。
+    expect(stream.push({ kind: 'content', text: '题\n\n**粗**' })).toBe('标题\n\n');
+    expect(stream.finish(turn({ content: '## 标题\n\n**粗**' }))).toBe('粗\n');
+  });
+
+  it('思维链不走 markdown（原文流式）', () => {
+    const stream = createReplyStream({ color: false, markdown: createMarkdownStream(markdown) });
+    expect(stream.push({ kind: 'reasoning', text: '**草稿**' })).toBe(`${THINK_PREFIX}**草稿**`);
+  });
+
+  it('/md 开关的回执讲清楚现状', () => {
+    expect(renderMarkdownToggle(true)).toContain('开');
+    expect(renderMarkdownToggle(false)).toContain('关');
+    expect(renderMarkdownToggle(false)).toContain('/md on');
+  });
+
+  it('/md 帮助里提到默认行为', () => {
+    expect(renderMarkdownUsage()).toContain('/md on');
+    expect(renderHelp()).toContain('/md on|off');
   });
 });

@@ -25,6 +25,9 @@ import type { ConfigStore } from '../config-store.js';
 import type { EnvFileResult } from '../env-file.js';
 import { updateEnvFile } from '../env-file.js';
 import { ConfigError, UserAbortError } from '../http/errors.js';
+import type { MarkdownOptions } from '../markdown/render.js';
+import { createMarkdownOptions } from '../markdown/render.js';
+import { createMarkdownStream } from '../markdown/stream.js';
 import type { ChatSession } from '../session/chat-session.js';
 import {
   CONFIG_MENU_PROMPT,
@@ -45,6 +48,8 @@ import {
   renderError,
   renderHistory,
   renderHelp,
+  renderMarkdownToggle,
+  renderMarkdownUsage,
   renderReply,
   renderResetDone,
   renderSystemUpdated,
@@ -80,6 +85,7 @@ export type ParsedInput =
   | { readonly kind: 'config'; readonly sub: 'save' }
   | { readonly kind: 'config'; readonly sub: 'unknown'; readonly name: string }
   | { readonly kind: 'think'; readonly mode: 'on' | 'off' | 'status' | 'unknown' }
+  | { readonly kind: 'markdown'; readonly mode: 'on' | 'off' | 'status' | 'unknown' }
   | { readonly kind: 'unknown'; readonly name: string }
   | { readonly kind: 'message'; readonly text: string };
 
@@ -122,6 +128,13 @@ export function parseInput(line: string): ParsedInput {
         return { kind: 'think', mode };
       }
       return { kind: 'think', mode: mode === '' ? 'status' : 'unknown' };
+    }
+    case '/md': {
+      const mode = rest.toLowerCase();
+      if (mode === 'on' || mode === 'off') {
+        return { kind: 'markdown', mode };
+      }
+      return { kind: 'markdown', mode: mode === '' ? 'status' : 'unknown' };
     }
     default:
       return { kind: 'unknown', name };
@@ -318,6 +331,27 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   let thinkEnabled = true;
   /** 「这个模型不给思维链」只提示一次，否则每回合都刷一行。 */
   let reasoningHintShown = false;
+  /**
+   * markdown 渲染开关。
+   *
+   * 默认值跟「是不是真终端」绑定：管道/重定向后面没人看方框和颜色，硬渲染只会把日志弄脏。
+   */
+  let markdownEnabled = interactive;
+
+  /** 终端宽度（拿不到就交给渲染器的默认宽度）。 */
+  const outputColumns = (): number | undefined => {
+    if ('columns' in output) {
+      const { columns } = output;
+      if (typeof columns === 'number') {
+        return columns;
+      }
+    }
+    return undefined;
+  };
+
+  /** 每回合现算：终端窗口可能被拖过，宽度不能缓存。 */
+  const markdownOptions = (): MarkdownOptions =>
+    createMarkdownOptions({ width: outputColumns(), color: interactive, highlight: interactive });
 
   /**
    * 画提示符。
@@ -465,6 +499,18 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
           output.write(`${renderThinkToggle(thinkEnabled)}\n`);
           writePrompt();
           continue;
+        case 'markdown':
+          if (parsed.mode === 'unknown') {
+            output.write(`${renderMarkdownUsage()}\n`);
+            writePrompt();
+            continue;
+          }
+          if (parsed.mode !== 'status') {
+            markdownEnabled = parsed.mode === 'on';
+          }
+          output.write(`${renderMarkdownToggle(markdownEnabled)}\n`);
+          writePrompt();
+          continue;
         case 'help':
           output.write(`${renderHelp()}\n`);
           writePrompt();
@@ -524,6 +570,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
             errorOutput,
             log,
             config: store.get(),
+            markdown: markdownEnabled ? markdownOptions() : undefined,
             think: {
               enabled: thinkEnabled,
               // 只有真终端才上色：管道与录像里的 ANSI 序列是噪音。
@@ -568,6 +615,7 @@ interface TurnContext {
   readonly errorOutput: NodeJS.WritableStream;
   readonly log: (message: string) => void;
   readonly config: AppConfig;
+  readonly markdown?: MarkdownOptions | undefined;
   readonly think: ThinkContext;
   readonly setInFlight: (controller: AbortController | undefined, turn: Promise<unknown> | undefined) => void;
 }
@@ -593,7 +641,13 @@ interface ThinkContext {
  */
 async function runTurn(text: string, context: TurnContext): Promise<number> {
   const controller = new AbortController();
-  const stream = context.think.enabled ? createReplyStream({ color: context.think.color }) : undefined;
+  const stream =
+    context.think.enabled
+      ? createReplyStream({
+          color: context.think.color,
+          markdown: context.markdown === undefined ? undefined : createMarkdownStream(context.markdown),
+        })
+      : undefined;
 
   const turn = context.session.turn(
     text,
@@ -615,7 +669,7 @@ async function runTurn(text: string, context: TurnContext): Promise<number> {
     const result = await turn;
 
     if (stream === undefined) {
-      context.output.write(`${renderReply(result)}\n`);
+      context.output.write(`${renderReply(result, { markdown: context.markdown })}\n`);
     } else {
       context.output.write(stream.finish(result));
       // 一个思维链都没收到：提示一次，并告诉用户能关。
